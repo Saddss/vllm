@@ -17,6 +17,7 @@ from vllm.v1.core.kv_cache_coordinator import (
     KVCacheCoordinator,
     get_kv_cache_coordinator,
 )
+from vllm.v1.core.kv_cache_utils import make_block_hash_with_group_id
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.kv_cache_interface import (
     FullAttentionSpec,
@@ -75,6 +76,7 @@ class SimpleCPUOffloadScheduler:
         scheduler_block_size: int,
         hash_block_size: int,
         lazy_offload: bool = False,
+        disk_offload_path: str = "",
     ):
         self.vllm_config = vllm_config
         self.kv_cache_config = kv_cache_config
@@ -179,6 +181,40 @@ class SimpleCPUOffloadScheduler:
         self._expected_worker_count = vllm_config.parallel_config.world_size
         self._store_event_pending_counts: dict[int, int] = {}
 
+        # --- Disk (L3) tier ---
+        # MVP scope: only the simple single-full-attention-group case where one
+        # block hash maps 1:1 to one CPU block (no sliding-window / mamba group
+        # alignment). Disk bytes live in the worker's CPU tensors; the scheduler
+        # only tracks which hashes are persisted and drives staging.
+        self._disk_enabled = bool(disk_offload_path) and (
+            len(self.cpu_kv_cache_config.kv_cache_groups) == 1
+            and self.block_size == self.fa_block_size == self.hash_block_size
+        )
+        if disk_offload_path and not self._disk_enabled:
+            logger.warning(
+                "SimpleCPUOffload disk tier disabled: only a single "
+                "full-attention group with uniform block size is supported."
+            )
+        elif self._disk_enabled:
+            logger.info("SimpleCPUOffload disk tier enabled at %s", disk_offload_path)
+        # BlockHashWithGroupId keys known to be persisted on disk.
+        self._on_disk: set[bytes] = set()
+        # In-flight disk->CPU staging: key -> cpu_block_id (dedup + keeps ref).
+        self._staging_keys: dict[bytes, int] = {}
+        # Keys with an in-flight CPU->disk write (write-through, dedup).
+        self._disk_store_pending: set[bytes] = set()
+        # Specs emitted to the worker in the next build_connector_meta.
+        self._pending_disk_load: list[tuple[int, bytes]] = []  # (cpu_block_id, key)
+        self._pending_disk_store: list[tuple[int, bytes]] = []
+        self._disk_load_event_counter: int = 0
+        self._disk_store_event_counter: int = 0
+        self._disk_load_event_to_specs: dict[int, list[tuple[int, bytes]]] = {}
+        self._disk_store_event_to_specs: dict[int, list[tuple[int, bytes]]] = {}
+        # (is_store, event) -> workers reported, for world_size aggregation.
+        self._disk_event_pending_counts: dict[tuple[bool, int], int] = {}
+        self._disk_loads_total = 0
+        self._disk_stores_total = 0
+
     @staticmethod
     def _derive_cpu_config(
         gpu_config: "KVCacheConfig", cpu_capacity_bytes: int
@@ -268,6 +304,16 @@ class SimpleCPUOffloadScheduler:
             remaining_hashes, max_hit_len
         )
 
+        # Disk (L3): stage contiguous on-disk blocks right after the CPU prefix
+        # into CPU (phase 1). While staging is in flight we return None so the
+        # scheduler defers the request without allocating GPU blocks. Once
+        # staged, they become normal CPU hits and the existing async CPU->GPU
+        # load (phase 2) serves them, so disk never holds GPU blocks.
+        if self._disk_enabled and self._stage_disk_extension(
+            request, num_computed_tokens, hit_length // self.hash_block_size
+        ):
+            return None, False
+
         if hit_length > 0:
             pin_blocks = [
                 blk for grp in cpu_hit_blocks for blk in grp if not blk.is_null
@@ -279,6 +325,52 @@ class SimpleCPUOffloadScheduler:
             )
             return hit_length, True
         return 0, False
+
+    def _stage_disk_extension(
+        self, request: "Request", num_computed_tokens: int, num_hash_hit: int
+    ) -> bool:
+        """Kick off disk->CPU staging for on-disk blocks after the CPU prefix.
+
+        Returns True if the request should be deferred (staging launched this
+        step, or an earlier staging of its prefix is still in flight).
+        """
+        num_skipped = num_computed_tokens // self.hash_block_size
+        remaining = request.block_hashes[num_skipped:]
+        max_hashes = (
+            request.num_tokens - 1 - num_computed_tokens
+        ) // self.hash_block_size
+
+        # Walk contiguous hashes after the CPU prefix; collect on-disk ones that
+        # are not yet being staged. Stop at the first hash that is neither in
+        # CPU nor on disk (prefix cache is a contiguous prefix).
+        to_stage: list[tuple[int, bytes]] = []  # (block_hash_idx, key)
+        waiting = False
+        i = num_hash_hit
+        while i < len(remaining) and i < max_hashes:
+            key = bytes(make_block_hash_with_group_id(remaining[i], self.fa_gidx))
+            if self.cpu_block_pool.cached_block_hash_to_block.get_one_block(key):
+                break
+            if key in self._staging_keys:
+                waiting = True
+            elif key in self._on_disk:
+                to_stage.append((i, key))
+            else:
+                break
+            i += 1
+
+        if not to_stage:
+            return waiting
+
+        # Allocate CPU blocks to receive the disk reads. If the CPU pool is
+        # full, fall back to normal recompute (do not defer forever).
+        if self.cpu_block_pool.get_num_free_blocks() < len(to_stage):
+            return waiting
+        cpu_blocks = self.cpu_block_pool.get_new_blocks(len(to_stage))
+        for blk, (_, key) in zip(cpu_blocks, to_stage):
+            blk._block_hash = key  # type: ignore[assignment]
+            self._staging_keys[key] = blk.block_id
+            self._pending_disk_load.append((blk.block_id, key))
+        return True
 
     # TODO(yifan): this API now only matches the suffix part of the prefix cache. A more
     # general API should scan blocks in both GPU and CPU block pool in a single pass.
@@ -444,6 +536,14 @@ class SimpleCPUOffloadScheduler:
                 self._reqs_to_load[req_id].load_event = load_event
             self._load_event_to_reqs[load_event] = load_req_ids
 
+        # --- Disk (L3) ---
+        disk_load_event, disk_load_cpu, disk_load_keys = self._emit_disk_specs(
+            self._pending_disk_load, is_store=False
+        )
+        disk_store_event, disk_store_cpu, disk_store_keys = self._emit_disk_specs(
+            self._pending_disk_store, is_store=True
+        )
+
         result = SimpleCPUOffloadMetadata(
             load_event=load_event,
             load_gpu_blocks=load_gpu,
@@ -456,8 +556,32 @@ class SimpleCPUOffloadScheduler:
             store_gpu_blocks=store_gpu,
             store_cpu_blocks=store_cpu,
             need_flush=bool(scheduler_output.preempted_req_ids),
+            disk_load_event=disk_load_event,
+            disk_load_cpu_blocks=disk_load_cpu,
+            disk_load_keys=disk_load_keys,
+            disk_store_event=disk_store_event,
+            disk_store_cpu_blocks=disk_store_cpu,
+            disk_store_keys=disk_store_keys,
         )
         return result
+
+    def _emit_disk_specs(
+        self, pending: list[tuple[int, bytes]], is_store: bool
+    ) -> tuple[int, list[int], list[str]]:
+        """Drain a pending disk queue into an event with block ids and hex keys."""
+        if not pending:
+            return -1, [], []
+        specs = list(pending)
+        pending.clear()
+        if is_store:
+            event = self._disk_store_event_counter
+            self._disk_store_event_counter += 1
+            self._disk_store_event_to_specs[event] = specs
+        else:
+            event = self._disk_load_event_counter
+            self._disk_load_event_counter += 1
+            self._disk_load_event_to_specs[event] = specs
+        return event, [b for b, _ in specs], [k.hex() for _, k in specs]
 
     def prepare_store_specs(
         self, scheduler_output: SchedulerOutput
@@ -704,6 +828,57 @@ class SimpleCPUOffloadScheduler:
             else:
                 self._store_event_pending_counts[event_idx] = total
 
+        # --- Disk (L3) completions (same per-world_size aggregation) ---
+        for event_idx, count in meta.completed_disk_load_events.items():
+            if self._disk_reached_all(False, event_idx, count):
+                self._process_disk_load_event(event_idx)
+        for event_idx, count in meta.completed_disk_store_events.items():
+            if self._disk_reached_all(True, event_idx, count):
+                self._process_disk_store_event(event_idx)
+
+    def _disk_reached_all(self, is_store: bool, event_idx: int, count: int) -> bool:
+        ekey = (is_store, event_idx)
+        total = self._disk_event_pending_counts.get(ekey, 0) + count
+        if total >= self._expected_worker_count:
+            self._disk_event_pending_counts.pop(ekey, None)
+            return True
+        self._disk_event_pending_counts[ekey] = total
+        return False
+
+    def _process_disk_load_event(self, event_idx: int) -> None:
+        """Staging done: insert staged CPU blocks into the cache map + unpin."""
+        specs = self._disk_load_event_to_specs.pop(event_idx, None)
+        if specs is None:
+            return
+        for cpu_bid, key in specs:
+            self._staging_keys.pop(key, None)
+            self._on_disk.add(key)
+            cpu_block = self.cpu_block_pool.blocks[cpu_bid]
+            self.cpu_block_pool.cached_block_hash_to_block.insert(key, cpu_block)
+        self.cpu_block_pool.free_blocks(self.cpu_block_pool.blocks[b] for b, _ in specs)
+        self._disk_loads_total += len(specs)
+        logger.info(
+            "SimpleCPUOffload disk: staged %d blocks disk->CPU (total=%d)",
+            len(specs),
+            self._disk_loads_total,
+        )
+
+    def _process_disk_store_event(self, event_idx: int) -> None:
+        """Write-through done: mark hashes persisted + release the write pin."""
+        specs = self._disk_store_event_to_specs.pop(event_idx, None)
+        if specs is None:
+            return
+        for _, key in specs:
+            self._on_disk.add(key)
+            self._disk_store_pending.discard(key)
+        self.cpu_block_pool.free_blocks(self.cpu_block_pool.blocks[b] for b, _ in specs)
+        self._disk_stores_total += len(specs)
+        logger.info(
+            "SimpleCPUOffload disk: wrote %d blocks CPU->disk (total=%d)",
+            len(specs),
+            self._disk_stores_total,
+        )
+
     def _process_store_event(self, event_idx: int) -> None:
         """Process a fully-completed store event."""
         transfer = self._store_event_to_blocks.pop(event_idx, None)
@@ -752,8 +927,23 @@ class SimpleCPUOffloadScheduler:
             assert bhash is not None
             self.cpu_block_pool.cached_block_hash_to_block.insert(bhash, cpu_block)
 
+        # Disk (L3) write-through: persist newly cached blocks not yet on disk.
+        # Keep them pinned (skip the free below) until the worker confirms the
+        # pwrite, so the CPU bytes cannot be evicted+reused mid-write. The pin
+        # is released in _process_disk_store_event().
+        disk_pinned: set[int] = set()
+        if self._disk_enabled:
+            for cpu_block in cpu_blocks:
+                key = bytes(cpu_block.block_hash)  # type: ignore[arg-type]
+                if key not in self._on_disk and key not in self._disk_store_pending:
+                    self._disk_store_pending.add(key)
+                    self._pending_disk_store.append((cpu_block.block_id, key))
+                    disk_pinned.add(cpu_block.block_id)
+
         # Free CPU and GPU blocks' ref counts to turn them into prefix cache
-        self.cpu_block_pool.free_blocks(cpu_blocks)
+        self.cpu_block_pool.free_blocks(
+            b for b in cpu_blocks if b.block_id not in disk_pinned
+        )
         assert self._gpu_block_pool is not None
         self._gpu_block_pool.free_blocks(
             self._gpu_block_pool.blocks[bid] for bid in gpu_block_ids
@@ -914,6 +1104,26 @@ class SimpleCPUOffloadScheduler:
         # NOTE: _load_event_counter / _store_event_counter are not
         # reset as they are monotonic and must stay ahead of the workers
         # high-water marks to avoid event index collisions
+
+        # Disk (L3): drop the index and release pins so the CPU cache can reset.
+        # Orphaned disk files are harmless; stale worker completions are ignored
+        # by the guarded pops in _process_disk_*_event().
+        if self._disk_enabled:
+            pinned_ids = list(self._staging_keys.values())
+            for specs in self._disk_store_event_to_specs.values():
+                pinned_ids.extend(b for b, _ in specs)
+            if pinned_ids:
+                self.cpu_block_pool.free_blocks(
+                    self.cpu_block_pool.blocks[b] for b in pinned_ids
+                )
+            self._staging_keys.clear()
+            self._pending_disk_load.clear()
+            self._pending_disk_store.clear()
+            self._disk_load_event_to_specs.clear()
+            self._disk_store_event_to_specs.clear()
+            self._disk_store_pending.clear()
+            self._disk_event_pending_counts.clear()
+            self._on_disk.clear()
 
         if self._abandoned_store_event_to_blocks or self._abandoned_reqs_to_load:
             return False
