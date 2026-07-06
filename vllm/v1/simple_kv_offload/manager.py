@@ -3,6 +3,7 @@
 """Scheduler-side manager for SimpleCPUOffloadConnector."""
 
 import contextlib
+from collections import OrderedDict, deque
 from collections.abc import Iterable
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
@@ -77,6 +78,7 @@ class SimpleCPUOffloadScheduler:
         hash_block_size: int,
         lazy_offload: bool = False,
         disk_offload_path: str = "",
+        disk_capacity_bytes: int = 0,
     ):
         self.vllm_config = vllm_config
         self.kv_cache_config = kv_cache_config
@@ -197,12 +199,31 @@ class SimpleCPUOffloadScheduler:
             )
         elif self._disk_enabled:
             logger.info("SimpleCPUOffload disk tier enabled at %s", disk_offload_path)
-        # BlockHashWithGroupId keys known to be persisted on disk.
-        self._on_disk: set[bytes] = set()
+        # BlockHashWithGroupId keys persisted on disk, in LRU order (oldest
+        # first). Bounded by disk_capacity_bytes when set; 0 = unbounded.
+        self._on_disk: OrderedDict[bytes, None] = OrderedDict()
+        block_bytes = max(1, cpu_capacity_bytes // max(1, self.num_cpu_blocks))
+        self._disk_max_blocks = (
+            disk_capacity_bytes // block_bytes if disk_capacity_bytes > 0 else 0
+        )
+        self._pending_disk_delete: list[bytes] = []
+        self._disk_evicts_total = 0
+        if self._disk_enabled and self._disk_max_blocks:
+            logger.info(
+                "SimpleCPUOffload disk tier capacity: %d blocks (%.2f GB)",
+                self._disk_max_blocks,
+                disk_capacity_bytes / (1024**3),
+            )
         # In-flight disk->CPU staging: key -> cpu_block_id (dedup + keeps ref).
         self._staging_keys: dict[bytes, int] = {}
-        # Keys with an in-flight CPU->disk write (write-through, dedup).
-        self._disk_store_pending: set[bytes] = set()
+        # Bounded write-back: newly cached blocks queue here UNPINNED. A step
+        # drains up to the pin budget, re-validates each block, pins + emits it.
+        # This caps how much of the CPU pool disk-store can pin at once, so
+        # write-back never starves disk->CPU staging (the old failure mode).
+        self._disk_store_queued: set[bytes] = set()
+        self._disk_store_backlog: deque[tuple[int, bytes]] = deque()
+        self._disk_write_pin_budget = max(1, self.num_cpu_blocks // 8)
+        self._disk_store_pinned = 0
         # Specs emitted to the worker in the next build_connector_meta.
         self._pending_disk_load: list[tuple[int, bytes]] = []  # (cpu_block_id, key)
         self._pending_disk_store: list[tuple[int, bytes]] = []
@@ -214,6 +235,12 @@ class SimpleCPUOffloadScheduler:
         self._disk_event_pending_counts: dict[tuple[bool, int], int] = {}
         self._disk_loads_total = 0
         self._disk_stores_total = 0
+        self._disk_io_failures = 0
+        # Best-effort deadline: after this many consecutive defers a request
+        # stops waiting on staging and just recomputes the disk suffix. Staging
+        # normally lands in 1-3 steps; this is a livelock/TTFT safety valve.
+        self._max_disk_defers = 32
+        self._req_defer_count: dict[str, int] = {}
 
     @staticmethod
     def _derive_cpu_config(
@@ -312,7 +339,13 @@ class SimpleCPUOffloadScheduler:
         if self._disk_enabled and self._stage_disk_extension(
             request, num_computed_tokens, hit_length // self.hash_block_size
         ):
-            return None, False
+            cnt = self._req_defer_count.get(request.request_id, 0) + 1
+            if cnt < self._max_disk_defers:
+                self._req_defer_count[request.request_id] = cnt
+                return None, False
+            # Deadline hit: stop deferring. In-flight staging still completes
+            # into the CPU cache; this request just recomputes its disk suffix.
+        self._req_defer_count.pop(request.request_id, None)
 
         if hit_length > 0:
             pin_blocks = [
@@ -353,6 +386,7 @@ class SimpleCPUOffloadScheduler:
             if key in self._staging_keys:
                 waiting = True
             elif key in self._on_disk:
+                self._on_disk.move_to_end(key)  # LRU: staging is an access
                 to_stage.append((i, key))
             else:
                 break
@@ -537,6 +571,7 @@ class SimpleCPUOffloadScheduler:
             self._load_event_to_reqs[load_event] = load_req_ids
 
         # --- Disk (L3) ---
+        self._drain_disk_store_backlog()
         disk_load_event, disk_load_cpu, disk_load_keys = self._emit_disk_specs(
             self._pending_disk_load, is_store=False
         )
@@ -562,8 +597,45 @@ class SimpleCPUOffloadScheduler:
             disk_store_event=disk_store_event,
             disk_store_cpu_blocks=disk_store_cpu,
             disk_store_keys=disk_store_keys,
+            disk_delete_keys=self._drain_disk_deletes(),
         )
         return result
+
+    def _drain_disk_deletes(self) -> list[str]:
+        if not self._pending_disk_delete:
+            return []
+        keys = [k.hex() for k in self._pending_disk_delete]
+        self._pending_disk_delete.clear()
+        logger.info(
+            "SimpleCPUOffload disk: LRU-evicted %d blocks (total=%d, on_disk=%d)",
+            len(keys),
+            self._disk_evicts_total,
+            len(self._on_disk),
+        )
+        return keys
+
+    def _drain_disk_store_backlog(self) -> None:
+        """Pin + emit backlogged write-backs, up to the remaining pin budget.
+
+        Each candidate was queued unpinned, so it may have been evicted and its
+        CPU block reused since. We re-validate ``block_hash == key`` before
+        pinning; a mismatch means the block was recycled, so we drop it (the
+        content is gone, nothing to persist).
+        """
+        room = self._disk_write_pin_budget - self._disk_store_pinned
+        while room > 0 and self._disk_store_backlog:
+            block_id, key = self._disk_store_backlog.popleft()
+            if key in self._on_disk:
+                self._disk_store_queued.discard(key)
+                continue
+            block = self.cpu_block_pool.blocks[block_id]
+            if block.block_hash is None or bytes(block.block_hash) != key:
+                self._disk_store_queued.discard(key)  # evicted + reused
+                continue
+            self.cpu_block_pool.touch([block])  # pin until the pwrite confirms
+            self._pending_disk_store.append((block_id, key))
+            self._disk_store_pinned += 1
+            room -= 1
 
     def _emit_disk_specs(
         self, pending: list[tuple[int, bytes]], is_store: bool
@@ -835,6 +907,14 @@ class SimpleCPUOffloadScheduler:
         for event_idx, count in meta.completed_disk_store_events.items():
             if self._disk_reached_all(True, event_idx, count):
                 self._process_disk_store_event(event_idx)
+        # Failures: a single worker failing an event fails it everywhere, so we
+        # act on first report (and clear any partial completion accounting).
+        for event_idx in meta.failed_disk_load_events:
+            self._disk_event_pending_counts.pop((False, event_idx), None)
+            self._fail_disk_load_event(event_idx)
+        for event_idx in meta.failed_disk_store_events:
+            self._disk_event_pending_counts.pop((True, event_idx), None)
+            self._fail_disk_store_event(event_idx)
 
     def _disk_reached_all(self, is_store: bool, event_idx: int, count: int) -> bool:
         ekey = (is_store, event_idx)
@@ -852,7 +932,7 @@ class SimpleCPUOffloadScheduler:
             return
         for cpu_bid, key in specs:
             self._staging_keys.pop(key, None)
-            self._on_disk.add(key)
+            self._mark_on_disk(key)
             cpu_block = self.cpu_block_pool.blocks[cpu_bid]
             self.cpu_block_pool.cached_block_hash_to_block.insert(key, cpu_block)
         self.cpu_block_pool.free_blocks(self.cpu_block_pool.blocks[b] for b, _ in specs)
@@ -869,8 +949,9 @@ class SimpleCPUOffloadScheduler:
         if specs is None:
             return
         for _, key in specs:
-            self._on_disk.add(key)
-            self._disk_store_pending.discard(key)
+            self._mark_on_disk(key)
+            self._disk_store_queued.discard(key)
+        self._disk_store_pinned -= len(specs)
         self.cpu_block_pool.free_blocks(self.cpu_block_pool.blocks[b] for b, _ in specs)
         self._disk_stores_total += len(specs)
         logger.info(
@@ -878,6 +959,64 @@ class SimpleCPUOffloadScheduler:
             len(specs),
             self._disk_stores_total,
         )
+
+    def _fail_disk_load_event(self, event_idx: int) -> None:
+        """Staging read failed: drop the key (so it re-misses / recomputes)
+        and release the reserved CPU blocks without caching a partial read."""
+        specs = self._disk_load_event_to_specs.pop(event_idx, None)
+        if specs is None:
+            return
+        for _, key in specs:
+            self._staging_keys.pop(key, None)
+            self._on_disk.pop(key, None)
+            self._pending_disk_delete.append(key)
+        self.cpu_block_pool.free_blocks(self.cpu_block_pool.blocks[b] for b, _ in specs)
+        self._disk_io_failures += len(specs)
+        logger.warning(
+            "SimpleCPUOffload disk: %d block(s) failed to stage disk->CPU; "
+            "dropping keys for recompute (failures total=%d)",
+            len(specs),
+            self._disk_io_failures,
+        )
+
+    def _fail_disk_store_event(self, event_idx: int) -> None:
+        """Write-back failed: release the pin and do NOT mark the key on disk
+        (delete any partial file so a later store can retry cleanly)."""
+        specs = self._disk_store_event_to_specs.pop(event_idx, None)
+        if specs is None:
+            return
+        for _, key in specs:
+            self._disk_store_queued.discard(key)
+            self._pending_disk_delete.append(key)
+        self._disk_store_pinned -= len(specs)
+        self.cpu_block_pool.free_blocks(self.cpu_block_pool.blocks[b] for b, _ in specs)
+        self._disk_io_failures += len(specs)
+        logger.warning(
+            "SimpleCPUOffload disk: %d block(s) failed to write CPU->disk; "
+            "not persisted (failures total=%d)",
+            len(specs),
+            self._disk_io_failures,
+        )
+
+    def _mark_on_disk(self, key: bytes) -> None:
+        """Record a key as persisted (MRU) and evict LRU keys over capacity."""
+        self._on_disk[key] = None
+        self._on_disk.move_to_end(key)
+        if not self._disk_max_blocks:
+            return
+        # Evict oldest first, but never a key with an in-flight staging read
+        # (it is still in _on_disk while being re-loaded into a CPU block).
+        while len(self._on_disk) > self._disk_max_blocks:
+            victim = None
+            for k in self._on_disk:  # oldest -> newest
+                if k not in self._staging_keys:
+                    victim = k
+                    break
+            if victim is None:
+                break  # everything left is pinned by staging; try again later
+            del self._on_disk[victim]
+            self._pending_disk_delete.append(victim)
+            self._disk_evicts_total += 1
 
     def _process_store_event(self, event_idx: int) -> None:
         """Process a fully-completed store event."""
@@ -927,23 +1066,20 @@ class SimpleCPUOffloadScheduler:
             assert bhash is not None
             self.cpu_block_pool.cached_block_hash_to_block.insert(bhash, cpu_block)
 
-        # Disk (L3) write-through: persist newly cached blocks not yet on disk.
-        # Keep them pinned (skip the free below) until the worker confirms the
-        # pwrite, so the CPU bytes cannot be evicted+reused mid-write. The pin
-        # is released in _process_disk_store_event().
-        disk_pinned: set[int] = set()
+        # Disk (L3) write-back: queue newly cached blocks as UNPINNED
+        # candidates. A later step (build_connector_meta) drains the backlog up
+        # to the pin budget, re-validates, and only then pins + writes them.
+        # Queuing without pinning keeps these blocks evictable, so write-back
+        # cannot exhaust the CPU pool and starve disk->CPU staging.
         if self._disk_enabled:
             for cpu_block in cpu_blocks:
                 key = bytes(cpu_block.block_hash)  # type: ignore[arg-type]
-                if key not in self._on_disk and key not in self._disk_store_pending:
-                    self._disk_store_pending.add(key)
-                    self._pending_disk_store.append((cpu_block.block_id, key))
-                    disk_pinned.add(cpu_block.block_id)
+                if key not in self._on_disk and key not in self._disk_store_queued:
+                    self._disk_store_queued.add(key)
+                    self._disk_store_backlog.append((cpu_block.block_id, key))
 
         # Free CPU and GPU blocks' ref counts to turn them into prefix cache
-        self.cpu_block_pool.free_blocks(
-            b for b in cpu_blocks if b.block_id not in disk_pinned
-        )
+        self.cpu_block_pool.free_blocks(cpu_blocks)
         assert self._gpu_block_pool is not None
         self._gpu_block_pool.free_blocks(
             self._gpu_block_pool.blocks[bid] for bid in gpu_block_ids
@@ -974,6 +1110,8 @@ class SimpleCPUOffloadScheduler:
         """Always returns (False, None). GPU blocks are protected by ref_cnt,
         so the scheduler can free blocks immediately."""
         req_id = request.request_id
+
+        self._req_defer_count.pop(req_id, None)
 
         # Release any temp CPU hit pin from get_num_new_matched_tokens()
         # if request is canceled or preempted before update_state_after_alloc()
@@ -1112,6 +1250,7 @@ class SimpleCPUOffloadScheduler:
             pinned_ids = list(self._staging_keys.values())
             for specs in self._disk_store_event_to_specs.values():
                 pinned_ids.extend(b for b, _ in specs)
+            pinned_ids.extend(b for b, _ in self._pending_disk_store)
             if pinned_ids:
                 self.cpu_block_pool.free_blocks(
                     self.cpu_block_pool.blocks[b] for b in pinned_ids
@@ -1121,8 +1260,11 @@ class SimpleCPUOffloadScheduler:
             self._pending_disk_store.clear()
             self._disk_load_event_to_specs.clear()
             self._disk_store_event_to_specs.clear()
-            self._disk_store_pending.clear()
+            self._disk_store_queued.clear()
+            self._disk_store_backlog.clear()
+            self._disk_store_pinned = 0
             self._disk_event_pending_counts.clear()
+            self._pending_disk_delete.clear()
             self._on_disk.clear()
 
         if self._abandoned_store_event_to_blocks or self._abandoned_reqs_to_load:

@@ -46,6 +46,9 @@ class SimpleCPUOffloadMetadata(KVConnectorMetadata):
     disk_store_event: int = INVALID_JOB_ID
     disk_store_cpu_blocks: list[int] = field(default_factory=list)
     disk_store_keys: list[str] = field(default_factory=list)
+    # LRU-evicted keys whose disk files the worker should unlink. The scheduler
+    # never evicts a key with an in-flight load, so deletes cannot race reads.
+    disk_delete_keys: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -62,6 +65,10 @@ class SimpleCPUOffloadWorkerMetadata(KVConnectorWorkerMetadata):
     # Disk (L3) completions, same per-world_size aggregation as stores.
     completed_disk_store_events: dict[int, int] = field(default_factory=dict)
     completed_disk_load_events: dict[int, int] = field(default_factory=dict)
+    # Disk IO failures: any worker reporting an event here fails it (the
+    # scheduler drops the block instead of caching a partial read).
+    failed_disk_store_events: dict[int, int] = field(default_factory=dict)
+    failed_disk_load_events: dict[int, int] = field(default_factory=dict)
 
     def aggregate(
         self, other: "KVConnectorWorkerMetadata"
@@ -83,5 +90,11 @@ class SimpleCPUOffloadWorkerMetadata(KVConnectorWorkerMetadata):
             ),
             completed_disk_load_events=_sum(
                 self.completed_disk_load_events, other.completed_disk_load_events
+            ),
+            failed_disk_store_events=_sum(
+                self.failed_disk_store_events, other.failed_disk_store_events
+            ),
+            failed_disk_load_events=_sum(
+                self.failed_disk_load_events, other.failed_disk_load_events
             ),
         )

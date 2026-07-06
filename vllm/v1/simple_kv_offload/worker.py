@@ -32,7 +32,7 @@ class SimpleCPUOffloadWorker:
         kv_cache_config: "KVCacheConfig | None",
         cpu_capacity_bytes: int,
         disk_offload_path: str = "",
-        disk_io_threads: int = 4,
+        disk_io_threads: int = 16,
     ):
         self.vllm_config = vllm_config
         self.kv_cache_config = kv_cache_config
@@ -44,6 +44,8 @@ class SimpleCPUOffloadWorker:
         self._pending_disk_store_events: set[int] = set()
         self._completed_disk_load_events: dict[int, int] = {}
         self._completed_disk_store_events: dict[int, int] = {}
+        self._failed_disk_load_events: dict[int, int] = {}
+        self._failed_disk_store_events: dict[int, int] = {}
 
         self.gpu_kv_caches: dict[str, torch.Tensor] | None = None
         self.cpu_kv_caches: dict[str, torch.Tensor] | None = None
@@ -202,8 +204,12 @@ class SimpleCPUOffloadWorker:
 
             rank = dist.get_rank() if dist.is_initialized() else 0
             root = f"{self.disk_offload_path}/rank{rank}"
+            n_rd = max(1, self.disk_io_threads // 2)
             self.disk_tier = DiskTier(
-                root, self.cpu_kv_caches, num_io_threads=self.disk_io_threads
+                root,
+                self.cpu_kv_caches,
+                n_read_threads=n_rd,
+                n_write_threads=max(1, self.disk_io_threads - n_rd),
             )
 
     def bind_connector_metadata(self, metadata: SimpleCPUOffloadMetadata) -> None:
@@ -284,6 +290,8 @@ class SimpleCPUOffloadWorker:
                     metadata.disk_store_event,
                 )
                 self._pending_disk_store_events.add(metadata.disk_store_event)
+            if metadata.disk_delete_keys:
+                self.disk_tier.delete(metadata.disk_delete_keys)
 
         # (2) Track completed transfer events
         finished_recving: set[str] = set()
@@ -295,6 +303,12 @@ class SimpleCPUOffloadWorker:
             for j in self.disk_tier.poll_completed(is_store=True):
                 self._pending_disk_store_events.discard(j)
                 self._completed_disk_store_events[j] = 1
+            for j in self.disk_tier.poll_failed(is_store=False):
+                self._pending_disk_load_events.discard(j)
+                self._failed_disk_load_events[j] = 1
+            for j in self.disk_tier.poll_failed(is_store=True):
+                self._pending_disk_store_events.discard(j)
+                self._failed_disk_store_events[j] = 1
 
         if self._pending_load_event_indices:
             load_wm = self._poll_stream_events(is_store=False)
@@ -320,16 +334,22 @@ class SimpleCPUOffloadWorker:
             self._completed_store_events
             or self._completed_disk_store_events
             or self._completed_disk_load_events
+            or self._failed_disk_store_events
+            or self._failed_disk_load_events
         ):
             return None
         meta = SimpleCPUOffloadWorkerMetadata(
             completed_store_events=self._completed_store_events,
             completed_disk_store_events=self._completed_disk_store_events,
             completed_disk_load_events=self._completed_disk_load_events,
+            failed_disk_store_events=self._failed_disk_store_events,
+            failed_disk_load_events=self._failed_disk_load_events,
         )
         self._completed_store_events = {}
         self._completed_disk_store_events = {}
         self._completed_disk_load_events = {}
+        self._failed_disk_store_events = {}
+        self._failed_disk_load_events = {}
         return meta
 
     def handle_preemptions(

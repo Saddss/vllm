@@ -4,14 +4,25 @@
 
 All disk IO is staged through the worker's pinned CPU tensors: a disk store
 reads a CPU block row and ``pwrite``s it to a per-block file; a disk load
-``pread``s the file back into a CPU block row. Disk never touches the GPU (no
-GDS). IO runs on a background thread pool so it stays off the critical path;
-completion is reported per event_idx and polled non-blocking by the worker.
+``preadv``s the file back into a CPU block row. Disk never touches the GPU (no
+GDS). IO runs on a pool of threads draining one priority queue where loads
+(staging, on the request critical path) preempt background write-back stores;
+a block is one contiguous file (page-first layout), one ``pwrite``/``preadv``.
 
-File layout is page-first: all KV segments of one block are concatenated into a
-single contiguous file, so a block is one ``pwrite``/``pread``.
+An event completes only when all its blocks succeed; if any block errors the
+event is reported as FAILED (via ``poll_failed``) so the scheduler drops it
+instead of caching a partially-read block.
+
+This is a cache, not a durable store: reads only need to see bytes written
+earlier in the same process, so we use plain buffered IO and skip ``fsync``.
+We deliberately do NOT ``fadvise(DONTNEED)`` on the hot path -- benchmarking
+showed that evicting dirty pages right after a write forces synchronous
+write-back (and even on reads costs ~25%), while buffered write-back lets the
+kernel flush lazily and lets a soon-re-staged block read straight from cache.
+The page cache holding cold KV is clean-reclaimable, so it can never OOM.
 """
 
+import itertools
 import os
 import queue
 import threading
@@ -23,75 +34,100 @@ from vllm.logger import init_logger
 logger = init_logger(__name__)
 
 
-def _row_bytes(row: torch.Tensor) -> memoryview:
-    # Zero-copy uint8 view over a contiguous CPU block row. ``.numpy()`` does
-    # not support bf16/fp8, so reinterpret as uint8 first.
-    return memoryview(row.reshape(-1).view(torch.uint8).numpy())
-
-
 class DiskTier:
     def __init__(
         self,
         root: str,
         cpu_kv_caches: dict[str, torch.Tensor],
-        num_io_threads: int = 4,
+        n_read_threads: int = 8,
+        n_write_threads: int = 8,
     ):
         self.root = root
         os.makedirs(root, exist_ok=True)
         # Fixed segment order defines the on-disk byte layout of a block.
         self.names = list(cpu_kv_caches.keys())
-        self.rows = cpu_kv_caches
-        self.seg_nbytes = [
-            cpu_kv_caches[n][0].reshape(-1).view(torch.uint8).numel()
-            for n in self.names
-        ]
-        self.block_nbytes = sum(self.seg_nbytes)
+        # Precompute a zero-copy uint8 memoryview for every (segment, block) row
+        # ONCE. Building these torch views holds the GIL; doing it per IO would
+        # serialize the worker pool. Workers then issue pure pwrite/preadv on the
+        # cached views (syscall releases the GIL), so IO scales across threads.
+        self._seg_mv: dict[str, list[memoryview]] = {}
+        for n in self.names:
+            t = cpu_kv_caches[n]
+            self._seg_mv[n] = [
+                memoryview(t[b].reshape(-1).view(torch.uint8).numpy())
+                for b in range(t.shape[0])
+            ]
+        self.block_nbytes = sum(len(self._seg_mv[n][0]) for n in self.names)
 
-        self._q: queue.Queue = queue.Queue()
+        # One queue drained by ALL threads, so a burst of either kind uses
+        # every thread instead of leaving half idle (priority set in _launch).
+        self._q: queue.PriorityQueue = queue.PriorityQueue()
+        self._seq = itertools.count()
         self._lock = threading.Lock()
         self._remaining: dict[tuple[bool, int], int] = {}
+        self._failed_events: set[tuple[bool, int]] = set()
         self._completed_store: list[int] = []
         self._completed_load: list[int] = []
-        self._threads = [
-            threading.Thread(target=self._worker, daemon=True)
-            for _ in range(num_io_threads)
-        ]
-        for t in self._threads:
+        self._failed_store: list[int] = []
+        self._failed_load: list[int] = []
+        self._made_dirs: set[str] = set()
+
+        n_threads = max(1, n_read_threads) + max(1, n_write_threads)
+        self._threads: list[threading.Thread] = []
+        for _ in range(n_threads):
+            t = threading.Thread(target=self._worker, daemon=True)
             t.start()
+            self._threads.append(t)
         logger.info(
             "SimpleCPUOffload DiskTier: root=%s block=%.2f MB io_threads=%d",
             root,
             self.block_nbytes / 1e6,
-            num_io_threads,
+            n_threads,
         )
 
     def _path(self, key: str) -> str:
         d = os.path.join(self.root, key[:3])
-        os.makedirs(d, exist_ok=True)
+        if d not in self._made_dirs:
+            os.makedirs(d, exist_ok=True)
+            self._made_dirs.add(d)
         return os.path.join(d, f"{key}.bin")
 
+    @staticmethod
+    def _unlink_quiet(path: str) -> None:
+        try:
+            os.unlink(path)
+        except FileNotFoundError:
+            pass
+        except OSError:
+            logger.exception("DiskTier unlink failed path=%s", path)
+
     def _store_one(self, block_id: int, key: str) -> None:
-        tmp = self._path(key) + ".tmp"
+        dest = self._path(key)
+        if os.path.exists(dest):  # dedup: identical content -> identical file
+            return
+        tmp = dest + ".tmp"
         fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o644)
         try:
             off = 0
             for name in self.names:
-                mv = _row_bytes(self.rows[name][block_id])
+                mv = self._seg_mv[name][block_id]
                 os.pwrite(fd, mv, off)
                 off += len(mv)
-            os.fsync(fd)
-            os.posix_fadvise(fd, 0, 0, os.POSIX_FADV_DONTNEED)
-        finally:
             os.close(fd)
-        os.replace(tmp, self._path(key))  # atomic publish
+            fd = -1
+            os.replace(tmp, dest)  # atomic publish; readers never see partials
+        except BaseException:
+            if fd != -1:
+                os.close(fd)
+            self._unlink_quiet(tmp)  # a partial/failed write must not linger
+            raise
 
     def _load_one(self, block_id: int, key: str) -> None:
         fd = os.open(self._path(key), os.O_RDONLY)
         try:
-            os.posix_fadvise(fd, 0, 0, os.POSIX_FADV_DONTNEED)
             off = 0
             for name in self.names:
-                mv = _row_bytes(self.rows[name][block_id])
+                mv = self._seg_mv[name][block_id]
                 n = os.preadv(fd, [mv], off)
                 assert n == len(mv), f"short read {n} != {len(mv)} for {key}"
                 off += len(mv)
@@ -100,22 +136,36 @@ class DiskTier:
 
     def _worker(self) -> None:
         while True:
-            is_store, event_idx, block_id, key = self._q.get()
+            _, _, is_store, event_idx, block_id, key = self._q.get()
+            ok = True
             try:
                 if is_store:
                     self._store_one(block_id, key)
                 else:
                     self._load_one(block_id, key)
-            except Exception:
-                logger.exception("DiskTier IO failed key=%s store=%s", key, is_store)
+            except Exception as e:
+                ok = False
+                # One line/block; the scheduler logs the aggregated per-event
+                # failure (with the traceback source implied by this warning).
+                logger.warning(
+                    "DiskTier IO failed key=%s store=%s: %r", key, is_store, e
+                )
             with self._lock:
                 ek = (is_store, event_idx)
+                if not ok:
+                    self._failed_events.add(ek)
                 self._remaining[ek] -= 1
                 if self._remaining[ek] == 0:
                     del self._remaining[ek]
-                    (
-                        self._completed_store if is_store else self._completed_load
-                    ).append(event_idx)
+                    failed = ek in self._failed_events
+                    self._failed_events.discard(ek)
+                    if failed:
+                        tgt = self._failed_store if is_store else self._failed_load
+                    else:
+                        tgt = (
+                            self._completed_store if is_store else self._completed_load
+                        )
+                    tgt.append(event_idx)
 
     def _launch(
         self, block_ids: list[int], keys: list[str], event_idx: int, is_store: bool
@@ -123,8 +173,9 @@ class DiskTier:
         assert len(block_ids) == len(keys)
         with self._lock:
             self._remaining[(is_store, event_idx)] = len(block_ids)
+        prio = 1 if is_store else 0  # loads (staging) preempt background stores
         for bid, key in zip(block_ids, keys):
-            self._q.put((is_store, event_idx, bid, key))
+            self._q.put((prio, next(self._seq), is_store, event_idx, bid, key))
 
     def launch_store(
         self, block_ids: list[int], keys: list[str], event_idx: int
@@ -144,6 +195,21 @@ class DiskTier:
             out = list(done)
             done.clear()
         return out
+
+    def poll_failed(self, is_store: bool) -> list[int]:
+        with self._lock:
+            failed = self._failed_store if is_store else self._failed_load
+            if not failed:
+                return []
+            out = list(failed)
+            failed.clear()
+        return out
+
+    def delete(self, keys: list[str]) -> None:
+        """Unlink evicted block files (best effort). Safe: the scheduler never
+        evicts a key that has an in-flight load."""
+        for key in keys:
+            self._unlink_quiet(self._path(key))
 
     def has_key(self, key: str) -> bool:
         return os.path.exists(self._path(key))
