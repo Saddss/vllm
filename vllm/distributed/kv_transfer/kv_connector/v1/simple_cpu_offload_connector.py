@@ -75,6 +75,11 @@ class SimpleCPUOffloadConnector(KVConnectorBase_V1, SupportsHMA):
             cpu_capacity_per_rank = explicit
 
         lazy_offload = bool(extra_config.get("lazy_offload", False))
+        # Optional disk (L3) tier. Empty path disables disk offloading.
+        disk_offload_path = extra_config.get("disk_offload_path") or ""
+        disk_io_threads = int(extra_config.get("disk_io_threads", 16))
+        # Per-rank disk budget in bytes; 0 = unbounded (LRU eviction disabled).
+        disk_capacity_bytes = int(extra_config.get("disk_capacity_bytes", 0))
 
         self.scheduler_manager: SimpleCPUOffloadScheduler | None = None
         self.worker_handler: SimpleCPUOffloadWorker | None = None
@@ -109,10 +114,16 @@ class SimpleCPUOffloadConnector(KVConnectorBase_V1, SupportsHMA):
                 scheduler_block_size=scheduler_block_size,
                 hash_block_size=hash_block_size,
                 lazy_offload=lazy_offload,
+                disk_offload_path=disk_offload_path,
+                disk_capacity_bytes=disk_capacity_bytes,
             )
         elif role == KVConnectorRole.WORKER:
             self.worker_handler = SimpleCPUOffloadWorker(
-                vllm_config, kv_cache_config, cpu_capacity_per_rank
+                vllm_config,
+                kv_cache_config,
+                cpu_capacity_per_rank,
+                disk_offload_path=disk_offload_path,
+                disk_io_threads=disk_io_threads,
             )
 
     # --- Worker-side methods ---
