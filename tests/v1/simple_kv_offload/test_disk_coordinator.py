@@ -210,22 +210,25 @@ def test_store_failure_releases_pin_and_queues_delete(tmp_path):
     assert out.store_event == INVALID_JOB_ID
 
 
-def _stage_one(pool, disk, key: bytes, persisted_first: bool = True):
-    """Persist `key`, then ask staging for a request whose 1st hash is key."""
-    if persisted_first:
-        blk = _cache_block(pool, key)
+def _persist_keys(pool, disk, keys):
+    """Persist keys to disk and evict them from CPU so staging is required."""
+    for k in keys:
+        blk = _cache_block(pool, k)
         disk.note_cached_blocks([blk])
         ev = disk.emit_step().store_event
         disk.on_worker_meta(_worker_meta(completed_disk_store_events={ev: 1}))
-        # Evict from CPU so the hash resolves to disk only.
-        evicted = pool.get_new_blocks(pool.get_num_free_blocks())
-        pool.free_blocks(evicted)
-    request = SimpleNamespace(
+    evicted = pool.get_new_blocks(pool.get_num_free_blocks())
+    pool.free_blocks(evicted)
+
+
+def _stage_one(pool, disk, key: bytes):
+    """Persist `key`, then build a request whose 1st hash is key."""
+    _persist_keys(pool, disk, [key])
+    return SimpleNamespace(
         request_id="req0",
         block_hashes=[key[:-4]],  # coordinator re-appends the group id
         num_tokens=2 * BLOCK_SIZE,  # room for one full hash block + 1 token
     )
-    return request
 
 
 def test_staging_defers_then_serves_as_cpu_hit(tmp_path):
@@ -263,6 +266,56 @@ def test_staging_failure_drops_key_for_recompute(tmp_path):
     assert all(b.ref_cnt == 0 for b in pool.blocks if not b.is_null)
     assert disk.emit_step().delete_keys == [key.hex()]
     assert disk.try_stage_and_defer(request, 0, 0) is False
+
+
+def test_staging_emission_is_chunked_and_progressive(tmp_path):
+    """A staging batch larger than the per-step cap must split into multiple
+    events so early chunks unblock without waiting for the whole batch."""
+    pool, disk = _make(tmp_path)
+    disk._stage_blocks_per_step = 2
+    keys = [_key(i) for i in range(3)]
+    _persist_keys(pool, disk, keys)
+    request = SimpleNamespace(
+        request_id="req0",
+        block_hashes=[k[:-4] for k in keys],
+        num_tokens=4 * BLOCK_SIZE,  # room for all three hash blocks
+    )
+
+    assert disk.try_stage_and_defer(request, 0, 0) is True
+    first = disk.emit_step()
+    assert first.load_keys == [k.hex() for k in keys[:2]]
+    second = disk.emit_step()
+    assert second.load_keys == [keys[2].hex()]
+
+    # Completing only the first chunk caches its keys; the request still
+    # defers on the third key, then unblocks when its chunk lands.
+    disk.on_worker_meta(_worker_meta(completed_disk_load_events={first.load_event: 1}))
+    assert pool.cached_block_hash_to_block.get_one_block(keys[0]) is not None
+    assert disk.try_stage_and_defer(request, 0, 2) is True
+    disk.on_worker_meta(_worker_meta(completed_disk_load_events={second.load_event: 1}))
+    assert disk.try_stage_and_defer(request, 0, 2) is False
+
+
+def test_staging_backpressure_falls_back_to_recompute(tmp_path):
+    """Past the in-flight staging bound, a new request must recompute (no
+    defer, no allocation) instead of joining a queue steps deep."""
+    pool, disk = _make(tmp_path)
+    disk._max_staging_blocks = 1
+    keys = [_key(1), _key(2), _key(3)]
+    _persist_keys(pool, disk, keys)
+
+    r1 = SimpleNamespace(
+        request_id="r1", block_hashes=[keys[0][:-4]], num_tokens=2 * BLOCK_SIZE
+    )
+    r2 = SimpleNamespace(
+        request_id="r2",
+        block_hashes=[keys[1][:-4], keys[2][:-4]],
+        num_tokens=3 * BLOCK_SIZE,
+    )
+    assert disk.try_stage_and_defer(r1, 0, 0) is True  # fills the bound
+    free_before = pool.get_num_free_blocks()
+    assert disk.try_stage_and_defer(r2, 0, 0) is False  # recompute, no defer
+    assert pool.get_num_free_blocks() == free_before  # nothing allocated
 
 
 def test_defer_deadline_gives_up(tmp_path):
@@ -318,7 +371,7 @@ def test_reset_releases_all_pins(tmp_path):
     blk = _cache_block(pool, _key(1))
     disk.note_cached_blocks([blk])
     disk.emit_step()
-    request = _stage_one(pool, disk, _key(2), persisted_first=True)
+    request = _stage_one(pool, disk, _key(2))
     assert disk.try_stage_and_defer(request, 0, 0) is True
 
     disk.reset()

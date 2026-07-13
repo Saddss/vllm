@@ -57,6 +57,13 @@ DiskSpec = tuple[int, bytes]
 # lands in 1-3 steps; this is a livelock/TTFT safety valve.
 MAX_DISK_DEFERS = 32
 
+# A staging event completes as a whole, so every request in it stays deferred
+# until the LAST block is read: an H100 preemption storm batched ~67 requests
+# into one 8636-block (20 GB) event whose stragglers gated them all. Cap the
+# per-step batch so completion is progressive; the remainder stays queued
+# (already pinned) and emits on later steps.
+STAGE_BLOCKS_PER_STEP = 1024
+
 
 @dataclass
 class DiskStepSpecs:
@@ -198,6 +205,13 @@ class DiskTierCoordinator:
         # When full, drop the OLDEST candidate: persistence is best-effort and
         # newest blocks are the ones most likely to still be valid at drain.
         self._backlog_limit = 4 * self._pin_budget
+        self._stage_blocks_per_step = STAGE_BLOCKS_PER_STEP
+        # Staging backpressure: past this many in-flight blocks a new request
+        # would join a queue already several steps deep, so it recomputes
+        # instead. Also bounds how much of the CPU pool staging can pin.
+        self._max_staging_blocks = min(
+            4 * self._stage_blocks_per_step, max(1, num_cpu_blocks // 4)
+        )
         # Specs emitted to the worker at the next emit_step().
         self._pending_load: list[DiskSpec] = []
         self._pending_store: list[DiskSpec] = []
@@ -274,6 +288,10 @@ class DiskTierCoordinator:
         if not to_stage:
             return waiting
 
+        # Backpressure: see _max_staging_blocks above.
+        if len(self._staging) + len(to_stage) > self._max_staging_blocks:
+            return waiting
+
         # Allocate CPU blocks to receive the disk reads. If the CPU pool is
         # full, fall back to normal recompute (do not defer forever).
         if self._pool.get_num_free_blocks() < len(to_stage):
@@ -332,8 +350,9 @@ class DiskTierCoordinator:
         out = DiskStepSpecs()
         self._drain_backlog()
         if self._pending_load:
-            specs = self._pending_load
-            self._pending_load = []
+            # Chunked FIFO; see STAGE_BLOCKS_PER_STEP above.
+            specs = self._pending_load[: self._stage_blocks_per_step]
+            del self._pending_load[: self._stage_blocks_per_step]
             out.load_event = self._loads.open(specs)
             out.load_cpu_blocks = [b for b, _ in specs]
             out.load_keys = [k.hex() for _, k in specs]
