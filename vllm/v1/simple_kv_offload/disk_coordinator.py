@@ -19,7 +19,9 @@ and the request is deferred (no GPU blocks held) until the staged blocks
 become normal CPU hits served by the existing async CPU->GPU load path.
 Stores are write-back: newly cached CPU blocks queue UNPINNED and a step
 drains up to a pin budget, so write-back can never exhaust the CPU pool
-and starve staging.
+and starve staging. The backlog is bounded with drop-oldest admission, so
+when KV production outruns disk write bandwidth persistence degrades to
+best-effort instead of queueing unboundedly.
 """
 
 import os
@@ -190,6 +192,12 @@ class DiskTierCoordinator:
         self._queued: set[bytes] = set()
         self._pinned = 0
         self._pin_budget = max(1, num_cpu_blocks // 8)
+        # Admission bound: KV can be produced faster than the disk absorbs it
+        # (an H100 fills 2048-token prompts at >1 GB/s of KV vs <1 GB/s NVMe
+        # write), so an unbounded backlog only accumulates stale entries.
+        # When full, drop the OLDEST candidate: persistence is best-effort and
+        # newest blocks are the ones most likely to still be valid at drain.
+        self._backlog_limit = 4 * self._pin_budget
         # Specs emitted to the worker at the next emit_step().
         self._pending_load: list[DiskSpec] = []
         self._pending_store: list[DiskSpec] = []
@@ -286,6 +294,9 @@ class DiskTierCoordinator:
         for cpu_block in cpu_blocks:
             key = bytes(cpu_block.block_hash)  # type: ignore[arg-type]
             if key not in self._on_disk and key not in self._queued:
+                if len(self._backlog) >= self._backlog_limit:
+                    _, dropped = self._backlog.popleft()
+                    self._queued.discard(dropped)
                 self._queued.add(key)
                 self._backlog.append((cpu_block.block_id, key))
 

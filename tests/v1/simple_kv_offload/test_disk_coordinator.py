@@ -165,6 +165,26 @@ def test_write_back_drain_respects_pin_budget(tmp_path):
     assert disk.emit_step().store_event == INVALID_JOB_ID
 
 
+def test_write_back_backlog_bounded_drop_oldest(tmp_path):
+    """When KV production outruns the disk, the backlog must stay bounded
+    and admit newest candidates by dropping the oldest (best-effort)."""
+    pool, disk = _make(tmp_path)
+    limit = disk._backlog_limit  # 4 * pin_budget = 8 for a 16-block pool
+    keys = [_key(i) for i in range(limit + 3)]
+    blocks = [_cache_block(pool, k) for k in keys]
+    disk.note_cached_blocks(blocks)
+
+    assert len(disk._backlog) == limit
+    # The 3 oldest were dropped and are re-admittable (not stuck in _queued).
+    for k in keys[:3]:
+        assert k not in disk._queued
+    # The newest survived.
+    assert keys[-1] in disk._queued
+    # Dropped keys can be re-queued later (e.g. re-cached after CPU eviction).
+    disk.note_cached_blocks([blocks[0]])
+    assert keys[0] in disk._queued
+
+
 def test_write_back_revalidates_recycled_blocks(tmp_path):
     pool, disk = _make(tmp_path)
     key = _key(1)

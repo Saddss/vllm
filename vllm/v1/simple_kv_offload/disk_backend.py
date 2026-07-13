@@ -176,7 +176,12 @@ class DiskTier:
 
     def _worker(self) -> None:
         while True:
-            _, _, is_store, event_idx, block_id, key = self._q.get()
+            _, _, kind, event_idx, block_id, key = self._q.get()
+            if kind == "delete":
+                # Fire-and-forget: no event accounting for unlinks.
+                self._unlink_quiet(self._path(key))
+                continue
+            is_store = kind == "store"
             ok = True
             try:
                 if is_store:
@@ -214,8 +219,9 @@ class DiskTier:
         with self._lock:
             self._remaining[(is_store, event_idx)] = len(block_ids)
         prio = 1 if is_store else 0  # loads (staging) preempt background stores
+        kind = "store" if is_store else "load"
         for bid, key in zip(block_ids, keys):
-            self._q.put((prio, next(self._seq), is_store, event_idx, bid, key))
+            self._q.put((prio, next(self._seq), kind, event_idx, bid, key))
 
     def launch_store(
         self, block_ids: list[int], keys: list[str], event_idx: int
@@ -246,10 +252,22 @@ class DiskTier:
         return out
 
     def delete(self, keys: list[str]) -> None:
-        """Unlink evicted block files (best effort); the eviction policy in
-        disk_coordinator guarantees no in-flight load reads these keys."""
+        """Queue evicted block files for unlink (best effort, asynchronous).
+
+        Unlinks run on the IO threads at store priority, FIFO with stores.
+        Doing them inline would stall the engine step: under LRU churn every
+        store evicts a key, and thousands of synchronous unlinks per second
+        on a write-saturated filesystem back up get_finished (observed as a
+        multi-second TTFT collapse on H100).
+
+        A queued delete can race a concurrent re-store of the same key; the
+        worst case is a missing file at staging time, which the load-failure
+        path already converts to a recompute. The eviction policy in
+        disk_coordinator guarantees no in-flight load reads these keys.
+        """
+        prio = 1  # FIFO with stores: a delete never overtakes an older store
         for key in keys:
-            self._unlink_quiet(self._path(key))
+            self._q.put((prio, next(self._seq), "delete", 0, 0, key))
 
     def has_key(self, key: str) -> bool:
         return os.path.exists(self._path(key))

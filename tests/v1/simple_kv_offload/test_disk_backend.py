@@ -124,6 +124,31 @@ def test_disk_tier_partial_failure_fails_whole_event(tmp_path):
     assert 1 not in tier.poll_completed(False)
 
 
+def test_disk_tier_delete_is_async_and_fifo_with_stores(tmp_path):
+    """delete() must not unlink inline (it runs on the IO threads) and must
+    never overtake an older store of the same key."""
+    torch.manual_seed(3)
+    cpu = {"k": torch.randn(4, 8, dtype=torch.float16)}
+    tier = DiskTier(str(tmp_path), cpu, n_read_threads=1, n_write_threads=1)
+
+    tier.launch_store([0], ["a"], event_idx=0)
+    assert _poll(tier, True, 0)
+
+    # Queued delete eventually removes the file.
+    tier.delete(["a"])
+    deadline = time.time() + 5
+    while tier.has_key("a") and time.time() < deadline:
+        time.sleep(0.01)
+    assert not tier.has_key("a")
+
+    # Store enqueued BEFORE a delete of another key must still land: FIFO
+    # ordering means the delete cannot overtake it.
+    tier.launch_store([1], ["b"], event_idx=1)
+    tier.delete(["a"])  # unrelated key, queued after the store
+    assert _poll(tier, True, 1)
+    assert tier.has_key("b")
+
+
 def test_disk_tier_failure_does_not_leak_into_next_event(tmp_path):
     """A failed event must not poison a later clean event's bookkeeping."""
     torch.manual_seed(2)
