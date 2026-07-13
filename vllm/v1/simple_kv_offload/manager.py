@@ -78,6 +78,7 @@ class SimpleCPUOffloadScheduler:
         lazy_offload: bool = False,
         disk_offload_path: str = "",
         disk_capacity_bytes: int = 0,
+        disk_stage_min_tokens: int = 8192,
     ):
         self.vllm_config = vllm_config
         self.kv_cache_config = kv_cache_config
@@ -197,6 +198,7 @@ class SimpleCPUOffloadScheduler:
             cpu_block_bytes=cpu_capacity_bytes // max(1, self.num_cpu_blocks),
             disk_offload_path=disk_offload_path,
             disk_capacity_bytes=disk_capacity_bytes,
+            disk_stage_min_tokens=disk_stage_min_tokens,
         )
 
     @staticmethod

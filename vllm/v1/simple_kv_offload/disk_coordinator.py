@@ -17,6 +17,8 @@ full-attention group with uniform block size, where one block hash maps
 Loads are two-phase: ``try_stage_and_defer`` kicks off disk->CPU staging
 and the request is deferred (no GPU blocks held) until the staged blocks
 become normal CPU hits served by the existing async CPU->GPU load path.
+Disk runs shorter than the staging crossover length recompute instead
+(see ``_stage_min_blocks``).
 Stores are write-back: newly cached CPU blocks queue UNPINNED and a step
 drains up to a pin budget, so write-back can never exhaust the CPU pool
 and starve staging. The backlog is bounded with drop-oldest admission, so
@@ -133,6 +135,7 @@ class DiskTierCoordinator:
         cpu_block_bytes: int,
         disk_offload_path: str,
         disk_capacity_bytes: int,
+        disk_stage_min_tokens: int,
     ) -> "DiskTierCoordinator | None":
         """Create a coordinator, or None (with a warning) when the model is
         outside the supported scope; see the module docstring."""
@@ -157,6 +160,7 @@ class DiskTierCoordinator:
             cpu_block_bytes=cpu_block_bytes,
             disk_offload_path=disk_offload_path,
             disk_capacity_bytes=disk_capacity_bytes,
+            disk_stage_min_tokens=disk_stage_min_tokens,
         )
 
     def __init__(
@@ -171,6 +175,7 @@ class DiskTierCoordinator:
         cpu_block_bytes: int,
         disk_offload_path: str,
         disk_capacity_bytes: int,
+        disk_stage_min_tokens: int = 0,
     ):
         self._vllm_config = vllm_config
         self._kv_cache_config = kv_cache_config
@@ -212,6 +217,15 @@ class DiskTierCoordinator:
         self._max_staging_blocks = min(
             4 * self._stage_blocks_per_step, max(1, num_cpu_blocks // 4)
         )
+        # Staging pays a fixed defer cost (one-plus scheduler round trips)
+        # regardless of length, so below a crossover length recompute wins:
+        # H100 + NVMe measured disk-hit vs recompute TTFT at +160%/+123%/~0%/
+        # -41% for 2k/4k/8k/16k-token prefixes. Disk runs shorter than this
+        # many blocks are not staged (the request just recomputes; the files
+        # stay on disk). The crossover shifts with GPU speed vs disk
+        # bandwidth, hence configurable (disk_stage_min_tokens; 0 = always
+        # stage).
+        self._stage_min_blocks = max(1, disk_stage_min_tokens // hash_block_size)
         # Specs emitted to the worker at the next emit_step().
         self._pending_load: list[DiskSpec] = []
         self._pending_store: list[DiskSpec] = []
@@ -279,13 +293,16 @@ class DiskTierCoordinator:
             if key in self._staging:
                 waiting = True
             elif key in self._on_disk:
-                self._on_disk.move_to_end(key)  # LRU: staging is an access
                 to_stage.append(key)
             else:
                 break
             i += 1
 
         if not to_stage:
+            return waiting
+
+        # Short runs recompute; see _stage_min_blocks above.
+        if len(to_stage) < self._stage_min_blocks:
             return waiting
 
         # Backpressure: see _max_staging_blocks above.
@@ -301,6 +318,9 @@ class DiskTierCoordinator:
             blk._block_hash = key  # type: ignore[assignment]
             self._staging[key] = blk.block_id
             self._pending_load.append((blk.block_id, key))
+            # LRU touch only for runs actually staged, so declined short runs
+            # cannot keep never-read keys MRU and pollute capacity eviction.
+            self._on_disk.move_to_end(key)
         return True
 
     # ------------------------------------------------------------------

@@ -80,6 +80,9 @@ class SimpleCPUOffloadConnector(KVConnectorBase_V1, SupportsHMA):
         disk_io_threads = int(extra_config.get("disk_io_threads", 16))
         # Per-rank disk budget in bytes; 0 = unbounded (LRU eviction disabled).
         disk_capacity_bytes = int(extra_config.get("disk_capacity_bytes", 0))
+        # Disk runs shorter than this recompute instead of staging; 0 = always
+        # stage. Crossover rationale in disk_coordinator._stage_min_blocks.
+        disk_stage_min_tokens = int(extra_config.get("disk_stage_min_tokens", 8192))
 
         self.scheduler_manager: SimpleCPUOffloadScheduler | None = None
         self.worker_handler: SimpleCPUOffloadWorker | None = None
@@ -116,6 +119,7 @@ class SimpleCPUOffloadConnector(KVConnectorBase_V1, SupportsHMA):
                 lazy_offload=lazy_offload,
                 disk_offload_path=disk_offload_path,
                 disk_capacity_bytes=disk_capacity_bytes,
+                disk_stage_min_tokens=disk_stage_min_tokens,
             )
         elif role == KVConnectorRole.WORKER:
             self.worker_handler = SimpleCPUOffloadWorker(

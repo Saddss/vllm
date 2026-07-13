@@ -47,7 +47,12 @@ def _configs(world_size: int = 1):
     return vllm_config, kv_cache_config
 
 
-def _make(tmp_path, capacity_bytes: int = 0, world_size: int = 1):
+def _make(
+    tmp_path,
+    capacity_bytes: int = 0,
+    world_size: int = 1,
+    stage_min_tokens: int = 0,
+):
     pool = BlockPool(
         num_gpu_blocks=NUM_CPU_BLOCKS,
         enable_caching=True,
@@ -64,6 +69,7 @@ def _make(tmp_path, capacity_bytes: int = 0, world_size: int = 1):
         cpu_block_bytes=BLOCK_BYTES,
         disk_offload_path=str(tmp_path),
         disk_capacity_bytes=capacity_bytes,
+        disk_stage_min_tokens=stage_min_tokens,
     )
     return pool, disk
 
@@ -97,6 +103,7 @@ def test_maybe_create_scope_gate(tmp_path):
         num_cpu_blocks=4,
         cpu_block_bytes=BLOCK_BYTES,
         disk_capacity_bytes=0,
+        disk_stage_min_tokens=0,
     )
     assert (
         DiskTierCoordinator.maybe_create(
@@ -294,6 +301,32 @@ def test_staging_emission_is_chunked_and_progressive(tmp_path):
     assert disk.try_stage_and_defer(request, 0, 2) is True
     disk.on_worker_meta(_worker_meta(completed_disk_load_events={second.load_event: 1}))
     assert disk.try_stage_and_defer(request, 0, 2) is False
+
+
+def test_stage_min_blocks_short_runs_recompute(tmp_path):
+    """Disk runs below the crossover length must recompute (no defer, no
+    allocation); runs at/above it stage normally."""
+    # 2-block threshold expressed in tokens: exercises the token->block math.
+    pool, disk = _make(tmp_path, stage_min_tokens=2 * BLOCK_SIZE)
+    keys = [_key(1), _key(2), _key(3)]
+    _persist_keys(pool, disk, keys)
+
+    short = SimpleNamespace(
+        request_id="short", block_hashes=[keys[0][:-4]], num_tokens=2 * BLOCK_SIZE
+    )
+    free_before = pool.get_num_free_blocks()
+    assert disk.try_stage_and_defer(short, 0, 0) is False
+    assert pool.get_num_free_blocks() == free_before  # nothing allocated
+    assert disk.emit_step().load_event == INVALID_JOB_ID
+    assert keys[0] in disk._on_disk  # declined key stays persisted
+
+    long = SimpleNamespace(
+        request_id="long",
+        block_hashes=[keys[1][:-4], keys[2][:-4]],
+        num_tokens=3 * BLOCK_SIZE,
+    )
+    assert disk.try_stage_and_defer(long, 0, 0) is True
+    assert len(disk.emit_step().load_keys) == 2
 
 
 def test_staging_backpressure_falls_back_to_recompute(tmp_path):
