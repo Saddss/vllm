@@ -54,10 +54,16 @@ logger = init_logger(__name__)
 # (cpu_block_id, block-hash key) pairs describing one block transfer.
 DiskSpec = tuple[int, bytes]
 
-# Best-effort deadline: after this many consecutive defers a request stops
-# waiting on staging and just recomputes the disk suffix. Staging normally
-# lands in 1-3 steps; this is a livelock/TTFT safety valve.
-MAX_DISK_DEFERS = 32
+# Best-effort deadlines for a deferred request. STALLED counts only steps
+# where the request's own staging made no progress (a stalled pipeline means
+# recompute will beat waiting); TOTAL is the absolute cap so a request that
+# keeps inching forward behind a deep queue still cannot livelock. Progress
+# must reset the stall counter: under a bulk reuse storm the queue is many
+# steps deep and a plain step counter expires mid-queue, shedding requests to
+# GPU recompute that is far slower than the disk pipeline (8xH100: 16k-prefix
+# storm TTFT p50 3.6s vs 0.5s for the old direct-read connector).
+MAX_STALLED_DISK_DEFERS = 32
+MAX_TOTAL_DISK_DEFERS = 128
 
 # A staging event completes as a whole, so every request in it stays deferred
 # until the LAST block is read: an H100 preemption storm batched ~67 requests
@@ -211,12 +217,13 @@ class DiskTierCoordinator:
         # newest blocks are the ones most likely to still be valid at drain.
         self._backlog_limit = 4 * self._pin_budget
         self._stage_blocks_per_step = STAGE_BLOCKS_PER_STEP
-        # Staging backpressure: past this many in-flight blocks a new request
-        # would join a queue already several steps deep, so it recomputes
-        # instead. Also bounds how much of the CPU pool staging can pin.
-        self._max_staging_blocks = min(
-            4 * self._stage_blocks_per_step, max(1, num_cpu_blocks // 4)
-        )
+        # Staging backpressure: bounds how much of the CPU pool staging can
+        # pin (1/3, leaving room for the write pin budget and normal traffic).
+        # Sized to keep the disk pipeline full under a bulk reuse storm:
+        # requests shed past this bound fall back to GPU recompute, which is
+        # far slower than a warm disk read, so a tight bound (R4 used 4
+        # chunks) turned a 16k-prefix storm into mass recompute.
+        self._max_staging_blocks = max(1, num_cpu_blocks // 3)
         # Staging pays a fixed defer cost (one-plus scheduler round trips)
         # regardless of length, so below a crossover length recompute wins:
         # H100 + NVMe measured disk-hit vs recompute TTFT at +160%/+123%/~0%/
@@ -233,7 +240,14 @@ class DiskTierCoordinator:
         expected = vllm_config.parallel_config.world_size
         self._loads = _EventLedger(expected)
         self._stores = _EventLedger(expected)
-        self._defer_counts: dict[str, int] = {}
+        self._max_stalled_defers = MAX_STALLED_DISK_DEFERS
+        self._max_total_defers = MAX_TOTAL_DISK_DEFERS
+        # Per-request defer bookkeeping: consecutive no-progress steps, total
+        # deferred steps, and last observed in-flight block count (progress
+        # signal); see MAX_STALLED_DISK_DEFERS above.
+        self._defer_stalls: dict[str, int] = {}
+        self._defer_totals: dict[str, int] = {}
+        self._defer_last_in_flight: dict[str, int] = {}
         # Stats (logged, not exported).
         self._evicts_total = 0
         self._loads_total = 0
@@ -253,27 +267,42 @@ class DiskTierCoordinator:
         and decide whether the request should be deferred this step.
 
         Returns True to defer (staging launched or still in flight, and the
-        request has not exhausted its defer budget). Once staged, the blocks
+        request has not exhausted its defer budgets). Once staged, the blocks
         are normal CPU hits and this returns False.
         """
         req_id = request.request_id
-        if not self._stage_extension(request, num_computed_tokens, num_hash_hit):
-            self._defer_counts.pop(req_id, None)
+        in_flight = self._stage_extension(request, num_computed_tokens, num_hash_hit)
+        if in_flight == 0:
+            self._drop_defer_state(req_id)
             return False
-        cnt = self._defer_counts.get(req_id, 0) + 1
-        if cnt >= MAX_DISK_DEFERS:
+        prev = self._defer_last_in_flight.get(req_id)
+        self._defer_last_in_flight[req_id] = in_flight
+        # Progress = strictly fewer in flight; see MAX_STALLED_DISK_DEFERS.
+        stalls = (
+            0
+            if prev is None or in_flight < prev
+            else self._defer_stalls.get(req_id, 0) + 1
+        )
+        total = self._defer_totals.get(req_id, 0) + 1
+        if stalls >= self._max_stalled_defers or total >= self._max_total_defers:
             # Deadline hit: stop deferring. In-flight staging still completes
             # into the CPU cache; this request just recomputes the suffix.
-            self._defer_counts.pop(req_id, None)
+            self._drop_defer_state(req_id)
             return False
-        self._defer_counts[req_id] = cnt
+        self._defer_stalls[req_id] = stalls
+        self._defer_totals[req_id] = total
         return True
+
+    def _drop_defer_state(self, req_id: str) -> None:
+        self._defer_stalls.pop(req_id, None)
+        self._defer_totals.pop(req_id, None)
+        self._defer_last_in_flight.pop(req_id, None)
 
     def _stage_extension(
         self, request: "Request", num_computed_tokens: int, num_hash_hit: int
-    ) -> bool:
-        """Returns True if staging for this request is in flight (launched
-        now or earlier)."""
+    ) -> int:
+        """Returns how many blocks of this request's prefix are in flight
+        (launched now or earlier); 0 = nothing to wait for."""
         num_skipped = num_computed_tokens // self._hash_block_size
         remaining = request.block_hashes[num_skipped:]
         max_hashes = (
@@ -284,14 +313,14 @@ class DiskTierCoordinator:
         # that are not yet being staged. Stop at the first hash that is
         # neither in CPU nor on disk (prefix cache is a contiguous prefix).
         to_stage: list[bytes] = []
-        waiting = False
+        waiting = 0
         i = num_hash_hit
         while i < len(remaining) and i < max_hashes:
             key = bytes(make_block_hash_with_group_id(remaining[i], self._fa_gidx))
             if self._pool.cached_block_hash_to_block.get_one_block(key):
                 break
             if key in self._staging:
-                waiting = True
+                waiting += 1
             elif key in self._on_disk:
                 to_stage.append(key)
             else:
@@ -321,7 +350,7 @@ class DiskTierCoordinator:
             # LRU touch only for runs actually staged, so declined short runs
             # cannot keep never-read keys MRU and pollute capacity eviction.
             self._on_disk.move_to_end(key)
-        return True
+        return waiting + len(to_stage)
 
     # ------------------------------------------------------------------
     # Store path: bounded write-back
@@ -550,7 +579,7 @@ class DiskTierCoordinator:
     # ------------------------------------------------------------------
 
     def on_request_finished(self, req_id: str) -> None:
-        self._defer_counts.pop(req_id, None)
+        self._drop_defer_state(req_id)
 
     def reset(self) -> None:
         """Drop the index and release pins so the CPU cache can reset.
@@ -573,5 +602,7 @@ class DiskTierCoordinator:
         self._pinned = 0
         self._loads.reset()
         self._stores.reset()
-        self._defer_counts.clear()
+        self._defer_stalls.clear()
+        self._defer_totals.clear()
+        self._defer_last_in_flight.clear()
         self._on_disk.clear()

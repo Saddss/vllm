@@ -77,7 +77,10 @@ class SimpleCPUOffloadConnector(KVConnectorBase_V1, SupportsHMA):
         lazy_offload = bool(extra_config.get("lazy_offload", False))
         # Optional disk (L3) tier. Empty path disables disk offloading.
         disk_offload_path = extra_config.get("disk_offload_path") or ""
-        disk_io_threads = int(extra_config.get("disk_io_threads", 16))
+        # 8 by default: on a write-saturated NVMe more threads only add kernel
+        # CPU contention that slows the engine loop (8xH100: 8 vs 32 threads
+        # cut no-hit TTFT 13% and TPOT 24%); throughput is disk-bound anyway.
+        disk_io_threads = int(extra_config.get("disk_io_threads", 8))
         # Per-rank disk budget in bytes; 0 = unbounded (LRU eviction disabled).
         disk_capacity_bytes = int(extra_config.get("disk_capacity_bytes", 0))
         # Disk runs shorter than this recompute instead of staging; 0 = always

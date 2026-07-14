@@ -36,7 +36,7 @@ class SimpleCPUOffloadWorker:
         kv_cache_config: "KVCacheConfig | None",
         cpu_capacity_bytes: int,
         disk_offload_path: str = "",
-        disk_io_threads: int = 16,
+        disk_io_threads: int = 8,  # default rationale in the connector
     ):
         self.vllm_config = vllm_config
         self.kv_cache_config = kv_cache_config

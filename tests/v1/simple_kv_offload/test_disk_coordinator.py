@@ -18,7 +18,7 @@ from vllm.v1.simple_kv_offload.disk_backend import (
     disk_tier_root,
 )
 from vllm.v1.simple_kv_offload.disk_coordinator import (
-    MAX_DISK_DEFERS,
+    MAX_STALLED_DISK_DEFERS,
     DiskTierCoordinator,
 )
 from vllm.v1.simple_kv_offload.metadata import (
@@ -351,14 +351,63 @@ def test_staging_backpressure_falls_back_to_recompute(tmp_path):
     assert pool.get_num_free_blocks() == free_before  # nothing allocated
 
 
-def test_defer_deadline_gives_up(tmp_path):
+def test_defer_stall_deadline_gives_up(tmp_path):
+    """With staging stuck (no completions), the stall budget expires."""
     pool, disk = _make(tmp_path)
     key = _key(3)
     request = _stage_one(pool, disk, key)
-    for _ in range(MAX_DISK_DEFERS - 1):
+    # First call launches (stall counter starts after it); then the stall
+    # budget of no-progress steps runs out.
+    assert disk.try_stage_and_defer(request, 0, 0) is True
+    for _ in range(MAX_STALLED_DISK_DEFERS - 1):
         assert disk.try_stage_and_defer(request, 0, 0) is True
-    # Deadline reached: stop deferring even though staging is in flight.
     assert disk.try_stage_and_defer(request, 0, 0) is False
+
+
+def test_defer_progress_resets_stall_budget(tmp_path):
+    """Chunk completions count as progress and must extend the deferral,
+    while the absolute total budget still terminates it."""
+    pool, disk = _make(tmp_path)
+    disk._stage_blocks_per_step = 1
+    disk._max_stalled_defers = 2
+    keys = [_key(1), _key(2)]
+    _persist_keys(pool, disk, keys)
+    request = SimpleNamespace(
+        request_id="req0",
+        block_hashes=[k[:-4] for k in keys],
+        num_tokens=3 * BLOCK_SIZE,
+    )
+
+    assert disk.try_stage_and_defer(request, 0, 0) is True  # launch, 2 in flight
+    assert disk.try_stage_and_defer(request, 0, 0) is True  # stall 1
+    # Complete the first chunk: in-flight 2 -> 1 = progress, stall resets.
+    # key1 is now a CPU hit, so the caller passes num_hash_hit=1 (mirroring
+    # the manager, which recomputes the CPU hit before asking us).
+    ev = disk.emit_step().load_event
+    disk.on_worker_meta(_worker_meta(completed_disk_load_events={ev: 1}))
+    assert disk.try_stage_and_defer(request, 0, 1) is True  # stall 0
+    assert disk.try_stage_and_defer(request, 0, 1) is True  # stall 1
+    # No further progress: the 2-step stall budget now expires.
+    assert disk.try_stage_and_defer(request, 0, 1) is False
+
+
+def test_defer_total_cap_terminates_despite_progress(tmp_path):
+    pool, disk = _make(tmp_path)
+    disk._max_total_defers = 1
+    keys = [_key(1), _key(2)]
+    _persist_keys(pool, disk, keys)
+    request = SimpleNamespace(
+        request_id="req0",
+        block_hashes=[k[:-4] for k in keys],
+        num_tokens=3 * BLOCK_SIZE,
+    )
+    # The very first deferred step already reaches the absolute cap.
+    assert disk.try_stage_and_defer(request, 0, 0) is False
+
+
+def test_staging_backpressure_cap_scales_with_pool(tmp_path):
+    pool, disk = _make(tmp_path)
+    assert disk._max_staging_blocks == NUM_CPU_BLOCKS // 3
 
 
 def test_capacity_lru_eviction_skips_staging_keys(tmp_path):
