@@ -70,7 +70,13 @@ MAX_TOTAL_DISK_DEFERS = 128
 # into one 8636-block (20 GB) event whose stragglers gated them all. Cap the
 # per-step batch so completion is progressive; the remainder stays queued
 # (already pinned) and emits on later steps.
-STAGE_BLOCKS_PER_STEP = 1024
+#
+# Sizing: too small serializes EMISSION -- at 1024 a 16k-token request is a
+# whole chunk, so a storm emitted one request per step and queue position
+# alone cost ~50-100 ms/slot (measured p50 1.4s vs 0.36s for direct reads).
+# Too large re-creates batch gating. 4096 emits ~4 such requests per step
+# while an event stays a sub-second read.
+STAGE_BLOCKS_PER_STEP = 4096
 
 
 @dataclass
