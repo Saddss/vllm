@@ -24,6 +24,7 @@ from vllm.v1.kv_cache_interface import (
     SlidingWindowSpec,
 )
 from vllm.v1.outputs import KVConnectorOutput
+from vllm.v1.simple_kv_offload.disk_coordinator import DiskTierCoordinator
 from vllm.v1.simple_kv_offload.metadata import (
     SimpleCPUOffloadMetadata,
     SimpleCPUOffloadWorkerMetadata,
@@ -75,6 +76,9 @@ class SimpleCPUOffloadScheduler:
         scheduler_block_size: int,
         hash_block_size: int,
         lazy_offload: bool = False,
+        disk_offload_path: str = "",
+        disk_capacity_bytes: int = 0,
+        disk_stage_min_tokens: int = 8192,
     ):
         self.vllm_config = vllm_config
         self.kv_cache_config = kv_cache_config
@@ -179,6 +183,24 @@ class SimpleCPUOffloadScheduler:
         self._expected_worker_count = vllm_config.parallel_config.world_size
         self._store_event_pending_counts: dict[int, int] = {}
 
+        # Optional disk (L3) tier; None when disabled or out of scope. All
+        # disk state and policy live in the coordinator.
+        self.disk = DiskTierCoordinator.maybe_create(
+            vllm_config,
+            kv_cache_config,
+            self.cpu_block_pool,
+            num_kv_cache_groups=len(self.cpu_kv_cache_config.kv_cache_groups),
+            fa_gidx=self.fa_gidx,
+            scheduler_block_size=self.block_size,
+            fa_block_size=self.fa_block_size,
+            hash_block_size=self.hash_block_size,
+            num_cpu_blocks=self.num_cpu_blocks,
+            cpu_block_bytes=cpu_capacity_bytes // max(1, self.num_cpu_blocks),
+            disk_offload_path=disk_offload_path,
+            disk_capacity_bytes=disk_capacity_bytes,
+            disk_stage_min_tokens=disk_stage_min_tokens,
+        )
+
     @staticmethod
     def _derive_cpu_config(
         gpu_config: "KVCacheConfig", cpu_capacity_bytes: int
@@ -267,6 +289,13 @@ class SimpleCPUOffloadScheduler:
         cpu_hit_blocks, hit_length = self.cpu_coordinator.find_longest_cache_hit(
             remaining_hashes, max_hit_len
         )
+
+        # Disk (L3): defer (holding no GPU blocks) while disk->CPU staging is
+        # in flight; see the two-phase load policy in disk_coordinator.
+        if self.disk is not None and self.disk.try_stage_and_defer(
+            request, num_computed_tokens, hit_length // self.hash_block_size
+        ):
+            return None, False
 
         if hit_length > 0:
             pin_blocks = [
@@ -457,6 +486,17 @@ class SimpleCPUOffloadScheduler:
             store_cpu_blocks=store_cpu,
             need_flush=bool(scheduler_output.preempted_req_ids),
         )
+
+        # --- Disk (L3) ---
+        if self.disk is not None:
+            disk_specs = self.disk.emit_step()
+            result.disk_load_event = disk_specs.load_event
+            result.disk_load_cpu_blocks = disk_specs.load_cpu_blocks
+            result.disk_load_keys = disk_specs.load_keys
+            result.disk_store_event = disk_specs.store_event
+            result.disk_store_cpu_blocks = disk_specs.store_cpu_blocks
+            result.disk_store_keys = disk_specs.store_keys
+            result.disk_delete_keys = disk_specs.delete_keys
         return result
 
     def prepare_store_specs(
@@ -704,6 +744,10 @@ class SimpleCPUOffloadScheduler:
             else:
                 self._store_event_pending_counts[event_idx] = total
 
+        # --- Disk (L3) completions/failures ---
+        if self.disk is not None:
+            self.disk.on_worker_meta(meta)
+
     def _process_store_event(self, event_idx: int) -> None:
         """Process a fully-completed store event."""
         transfer = self._store_event_to_blocks.pop(event_idx, None)
@@ -752,6 +796,10 @@ class SimpleCPUOffloadScheduler:
             assert bhash is not None
             self.cpu_block_pool.cached_block_hash_to_block.insert(bhash, cpu_block)
 
+        # Disk (L3): queue the newly cached blocks for background write-back.
+        if self.disk is not None:
+            self.disk.note_cached_blocks(cpu_blocks)
+
         # Free CPU and GPU blocks' ref counts to turn them into prefix cache
         self.cpu_block_pool.free_blocks(cpu_blocks)
         assert self._gpu_block_pool is not None
@@ -784,6 +832,9 @@ class SimpleCPUOffloadScheduler:
         """Always returns (False, None). GPU blocks are protected by ref_cnt,
         so the scheduler can free blocks immediately."""
         req_id = request.request_id
+
+        if self.disk is not None:
+            self.disk.on_request_finished(req_id)
 
         # Release any temp CPU hit pin from get_num_new_matched_tokens()
         # if request is canceled or preempted before update_state_after_alloc()
@@ -914,6 +965,9 @@ class SimpleCPUOffloadScheduler:
         # NOTE: _load_event_counter / _store_event_counter are not
         # reset as they are monotonic and must stay ahead of the workers
         # high-water marks to avoid event index collisions
+
+        if self.disk is not None:
+            self.disk.reset()
 
         if self._abandoned_store_event_to_blocks or self._abandoned_reqs_to_load:
             return False
