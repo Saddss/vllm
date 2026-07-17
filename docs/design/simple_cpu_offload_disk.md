@@ -27,6 +27,21 @@ The implementation has two components:
 | [DiskTierCoordinator][vllm.v1.simple_kv_offload.disk_coordinator.DiskTierCoordinator] | Scheduler | Disk index, load staging, write-back, capacity LRU, restart recovery, and event state |
 | [DiskTier][vllm.v1.simple_kv_offload.disk_backend.DiskTier] | Worker | I/O thread pool, file reads/writes, asynchronous deletion, and event completion/failure accounting |
 
+## Implementation map
+
+The following table maps the rest of this document to the implementation.
+Paths are relative to this document and can be opened directly from GitHub.
+
+| Area | Source locations |
+| --- | --- |
+| Connector configuration and hook delegation | [`simple_cpu_offload_connector.py`](../../vllm/distributed/kv_transfer/kv_connector/v1/simple_cpu_offload_connector.py): `SimpleCPUOffloadConnector.__init__`, `get_num_new_matched_tokens`, `build_connector_meta`, `update_connector_output`, `reset_cache` |
+| Integration with the CPU offload manager | [`manager.py`](../../vllm/v1/simple_kv_offload/manager.py): `SimpleCPUOffloadScheduler.get_num_new_matched_tokens`, `_process_store_completion`, `request_finished`, `reset` |
+| Disk policy and scheduler-side state | [`disk_coordinator.py`](../../vllm/v1/simple_kv_offload/disk_coordinator.py): `DiskTierCoordinator` |
+| File format, I/O queue, event completion | [`disk_backend.py`](../../vllm/v1/simple_kv_offload/disk_backend.py): `DiskTier`, `disk_config_fingerprint`, `disk_tier_root` |
+| Scheduler-to-worker and worker-to-scheduler messages | [`metadata.py`](../../vllm/v1/simple_kv_offload/metadata.py): `SimpleCPUOffloadMetadata`, `SimpleCPUOffloadWorkerMetadata`; [`kv_connector/utils.py`](../../vllm/distributed/kv_transfer/kv_connector/utils.py): `KVOutputAggregator` |
+| Worker CPU storage and transfer submission | [`worker.py`](../../vllm/v1/simple_kv_offload/worker.py): `SimpleCPUOffloadWorker.register_kv_caches`, `get_finished`, `build_connector_worker_meta` |
+| Request scheduling and external-KV promotion | [`scheduler.py`](../../vllm/v1/core/sched/scheduler.py): `Scheduler.schedule`, `_update_from_kv_xfer_finished`, `_try_promote_blocked_waiting_request`, `_update_waiting_for_remote_kv` |
+
 ## Request lifecycle
 
 The following example follows one prefix through its first computation,
@@ -51,7 +66,8 @@ R1 enters the scheduler
   |
   +-- R1 may continue decoding or finish; write-back no longer depends on R1
   |
-  +-- worker writes the file; the scheduler records the key in _on_disk
+  +-- worker writes and atomically publishes its rank's file
+        +-- after every worker reports success, _on_store_done records _on_disk
 ```
 
 The request does not wait for disk write-back. A file is an asynchronous copy
@@ -105,9 +121,25 @@ WAITING (disk-to-CPU, no GPU blocks)
     -> WAITING / RUNNING
 ```
 
-If the disk run is too short, the CPU pool cannot admit its staging blocks,
-backpressure is reached, or I/O stops making progress, the request stops waiting
-for that copy and recomputes.
+There is no dedicated disk-wait request status. While
+`request.num_computed_tokens == 0`, each scheduling attempt calls the connector.
+`get_num_new_matched_tokens()` returns `(None, False)`, and
+`Scheduler.schedule()` skips the request for that step while leaving it in
+`WAITING`. Disk completion is reported through
+`completed_disk_load_events` in worker metadata, not through
+`finished_recving`.
+
+After staging turns the run into a CPU hit, `(hit_length, True)` starts the
+ordinary external-KV path. CPU-to-GPU completion is the phase that uses
+`finished_recving`; promotion normally returns the request to `WAITING`, or to
+`PREEMPTED` if it already has preemptions.
+
+If the disk run is too short or the CPU pool cannot admit its staging blocks,
+no new staging is created. If the request has no shared blocks already in
+flight, it is never deferred and immediately follows the recompute path. If it
+already has in-flight blocks, it continues waiting for those blocks. A request
+also gives up and recomputes when its I/O stops making progress long enough to
+reach a defer limit.
 
 ### Restart
 
@@ -222,14 +254,21 @@ Each KV block is stored in one file:
 <disk_offload_path>/<config_fingerprint>/rank<i>/<key[0:3]>/<key>.bin
 ```
 
-`key` is the hexadecimal representation of `BlockHashWithGroupId`. The file
-concatenates every storage segment belonging to the same CPU block in a fixed
-order. During KV cache registration, the worker converts physical layouts into
-raw `[num_cpu_blocks, bytes_per_block]` views. The disk tier does not need to
-understand K/V, layers, or attention backends.
+The scheduler stores `BlockHashWithGroupId` keys as bytes in `_on_disk` and
+`_staging`. `emit_step()` converts them to hexadecimal strings only at the
+scheduler-to-worker metadata boundary; the worker uses that string as the file
+name.
 
-`config_fingerprint` includes model, revision, model dtype, quantization, KV
-cache dtype, block size, and every KV group's layer names and cache spec.
+The file concatenates every storage segment belonging to the same CPU block.
+During KV cache registration, the worker creates one
+`[num_cpu_blocks, segment_bytes]` view per unique storage segment. Segment order
+is the insertion order of `cpu_kv_caches` (including generated names such as
+`<layer>.<segment>`), not a separately sorted canonical order. The disk tier
+does not otherwise interpret K/V, layers, or attention backends.
+
+`config_fingerprint` is the first 16 hexadecimal characters of a SHA-256 digest
+over model, revision, model dtype, quantization, KV cache dtype, block size, and
+every KV group's layer names and cache spec.
 
 Block files do not contain a per-file checksum. The fingerprint directory is a
 correctness boundary: different KV layouts can have the same bytes per block,
@@ -249,7 +288,7 @@ fingerprint-version update.
 | `_on_disk: OrderedDict[key, None]` | Keys known to have complete files, in LRU order |
 | `_staging[key] = cpu_block_id` | Blocks queued for or currently undergoing disk-to-CPU staging |
 | `_pending_load` | Reads with allocated CPU blocks not yet emitted in step metadata |
-| `_backlog` / `_queued` | Write-back candidates not yet pinned |
+| `_backlog` / `_queued` | Write-back candidates not yet write-pinned; backlog length is four times the write pin budget and uses drop-oldest admission |
 | `_pending_store` | Write-back blocks that have been revalidated and pinned |
 | `_loads` / `_stores` | Event specs and multi-worker completion counts |
 | `_pending_delete` | Keys awaiting asynchronous deletion |
@@ -275,7 +314,19 @@ from being reused while an IO operation accesses them:
   DMA completion releases both pins. Disk staging itself is block-owned rather
   than request-owned and continues after request cancellation.
 
+At the instant `_process_store_completion()` calls `note_cached_blocks()`, a
+new CPU block still holds its allocation reference. The same function releases
+that reference immediately afterward. “Unpinned backlog” means no additional
+write `touch()` is held while queued; it does not mean the reference has already
+reached zero at the exact call site.
+
 ## Write-back lifecycle
+
+Implementation:
+[`SimpleCPUOffloadScheduler._process_store_completion`](../../vllm/v1/simple_kv_offload/manager.py),
+[`DiskTierCoordinator.note_cached_blocks`](../../vllm/v1/simple_kv_offload/disk_coordinator.py),
+[`DiskTierCoordinator._drain_backlog`](../../vllm/v1/simple_kv_offload/disk_coordinator.py),
+and [`DiskTier._store_one`](../../vllm/v1/simple_kv_offload/disk_backend.py).
 
 The disk tier begins after a GPU-to-CPU store event inserts blocks into the CPU
 prefix cache:
@@ -296,22 +347,27 @@ CPU cache insertion
 `(cpu_block_id, key)` without pinning. If the backlog is full, it removes the
 oldest candidate.
 
-Each step, `_drain_backlog()` fills at most one eighth of the CPU pool as the
-write pin budget:
+Each step, `_drain_backlog()` can fill only
+`write_pin_budget - currently_pinned` slots. The budget is one eighth of the
+CPU pool, and incomplete store events from earlier steps continue to consume
+it:
 
 - A key already in `_on_disk` is skipped.
-- A block whose current hash no longer matches the candidate key was reused and
-  is skipped.
+- A block whose hash is absent or no longer matches the candidate key was
+  evicted/reused and is skipped.
 - A valid block is `touch()`ed and moved to `_pending_store`.
 
 ### Worker write and completion
 
-`emit_step()` creates a disk store event. The CPU contents are stable because
-the preceding GPU-to-CPU event has already completed.
+`emit_step()` first drains the backlog and then creates one disk store event
+containing all `_pending_store` specs admitted under the remaining pin budget.
+The CPU contents are stable because the preceding GPU-to-CPU event has already
+completed.
 
 `DiskTier._store_one()` writes `<key>.bin.tmp`, `pwrite`s every segment, and
-publishes with `os.replace()`. Existing files are deduplicated. Any exception
-closes the fd and removes the temporary file.
+publishes with `os.replace()`. If the destination already exists, the operation
+is a no-op success and no temporary file is created. Any exception closes the
+fd and removes the temporary file.
 
 The current implementation does not check the byte count returned by
 `os.pwrite()`. A short write can therefore be published without raising; later
@@ -320,19 +376,32 @@ insufficient. The writer must loop until each segment is complete (or treat a
 short write as event failure) before this path can claim complete short-write
 protection.
 
-After all workers succeed, `_on_store_done()` records the key as MRU and
-releases the CPU write pin. Failure leaves the key absent from `_on_disk`,
-releases the pin, and schedules residual-file deletion.
+After all workers succeed, `_on_store_done()` records the key as MRU (which can
+queue capacity evictions) and then releases the CPU write pin. Physical deletes
+are emitted on a later scheduler step. Failure leaves the key absent from
+`_on_disk`, releases the pin, and schedules deletion of the published path; the
+worker has already removed any `.tmp` file from the failed write.
 
 ## Lazy offload support
+
+Implementation:
+[`SimpleCPUOffloadScheduler.prepare_store_specs`](../../vllm/v1/simple_kv_offload/manager.py),
+[`_prepare_eager_store_specs`](../../vllm/v1/simple_kv_offload/manager.py),
+[`_prepare_lazy_store_specs`](../../vllm/v1/simple_kv_offload/manager.py), and
+[`_process_store_completion`](../../vllm/v1/simple_kv_offload/manager.py).
 
 `lazy_offload` controls **GPU-to-CPU candidate discovery**, not disk writing.
 
 In eager mode, SimpleCPUOffload tracks complete, confirmed GPU blocks per
 request and copies them into CPU early. In lazy mode, it scans the GPU
-BlockPool free queue and copies cached blocks close to reuse. The lazy scan
-uses a watermark derived from the maximum per-step KV demand and resumes after
-the last free-queue block it visited.
+BlockPool free queue and copies cached blocks close to reuse.
+
+The lazy target sums a per-group estimate: two blocks for Mamba, sliding-window
+blocks plus one for sliding-window attention, and
+`ceil(max_num_batched_tokens / effective_block_size)` for other groups. It then
+doubles that sum as a watermark. Scanning resumes after the last free-queue
+block visited; if that saved block is referenced again, the position is
+invalidated and scanning restarts at the queue head.
 
 Both modes converge in `_process_store_completion()`, which installs the CPU
 cache entry and calls `disk.note_cached_blocks()`:
@@ -342,18 +411,30 @@ eager GPU-to-CPU -> CPU cache -> disk backlog
 lazy  GPU-to-CPU -> CPU cache -> disk backlog
 ```
 
-The disk tier therefore supports both existing modes without a separate disk
-code path. It does **not** implement lazy disk writes: a CPU block becomes a
-write-back candidate immediately after CPU-cache insertion rather than at CPU
-eviction.
+The eager path maintains per-request store state, confirmed-token progress, and
+an in-flight GPU-block deduplication set. The lazy path has no request-level
+store state and returns no request IDs with its store specs. Both pin selected
+GPU blocks during DMA and converge only after the GPU-to-CPU event completes.
+
+The disk tier therefore supports both modes without a separate disk code path.
+It does **not** implement lazy disk writes: a CPU block becomes a write-back
+candidate immediately after CPU-cache insertion rather than at CPU eviction.
 
 ## Disk read lifecycle
+
+Implementation:
+[`SimpleCPUOffloadScheduler.get_num_new_matched_tokens`](../../vllm/v1/simple_kv_offload/manager.py),
+[`DiskTierCoordinator.try_stage_and_defer`](../../vllm/v1/simple_kv_offload/disk_coordinator.py),
+[`DiskTierCoordinator._stage_extension`](../../vllm/v1/simple_kv_offload/disk_coordinator.py),
+[`DiskTierCoordinator.emit_step`](../../vllm/v1/simple_kv_offload/disk_coordinator.py),
+and [`DiskTier._load_one`](../../vllm/v1/simple_kv_offload/disk_backend.py).
 
 ### Consecutive-run discovery
 
 After the CPU coordinator reports its prefix hit,
-`try_stage_and_defer(request, num_computed_tokens, num_cpu_hash_hits)` continues
-through `request.block_hashes`:
+`try_stage_and_defer(request, num_computed_tokens, num_hash_hit)` continues
+through `request.block_hashes`, where
+`num_hash_hit = hit_length // hash_block_size`:
 
 - A key in `_staging` counts as already in flight and is not allocated again.
 - A key in `_on_disk` is appended to `to_stage`.
@@ -361,6 +442,11 @@ through `request.block_hashes`:
   will recompute the CPU hit.
 - A key absent from CPU, staging, and disk stops the consecutive prefix.
 - The final incomplete block is not cacheable.
+
+The disk extension check runs before the manager returns the CPU hit. If any
+part of the extension is staging, the method returns `(None, False)` for that
+step even when the CPU coordinator already found an earlier prefix. The CPU hit
+is exposed only after disk deferral finishes or gives up.
 
 ### Admission and allocation
 
@@ -390,18 +476,25 @@ hit and uses the existing CPU-to-GPU path.
 
 The coordinator recounts how many of the request's prefix blocks remain in
 `_staging` on every match attempt. A decrease resets the stall counter. After
-32 consecutive no-progress attempts or 128 total deferred attempts, the
-request recomputes. Submitted I/O continues because staging is block-keyed and
+32 consecutive no-progress attempts the request recomputes. The total counter
+permits at most 127 successful defer returns: the attempt that increments it to
+128 returns `False`. Submitted I/O continues because staging is block-keyed and
 can serve other requests.
 
 ## Request finish, preemption, and reset
+
+Implementation:
+[`SimpleCPUOffloadScheduler.request_finished`](../../vllm/v1/simple_kv_offload/manager.py),
+[`SimpleCPUOffloadWorker.handle_preemptions`](../../vllm/v1/simple_kv_offload/worker.py),
+[`SimpleCPUOffloadScheduler.reset`](../../vllm/v1/simple_kv_offload/manager.py),
+and [`DiskTierCoordinator.reset`](../../vllm/v1/simple_kv_offload/disk_coordinator.py).
 
 Finishing a request clears only its defer bookkeeping. Disk staging and
 write-back are block-keyed, not request-owned, and continue to completion.
 
 GPU preemption synchronizes existing GPU-to-CPU and CPU-to-GPU DMA before GPU
 blocks can be reused. Disk I/O operates on separately allocated CPU blocks and
-is not cancelled by GPU preemption.
+is neither cancelled nor quiesced by GPU preemption.
 
 `DiskTierCoordinator.reset()` currently releases CPU blocks held by staging and
 disk stores, clears queues, event ledgers, defer state, and the in-memory disk
@@ -411,7 +504,18 @@ Reset is therefore unsafe while disk load/store events are in flight. A safe
 implementation must quiesce the disk worker or retain the references until
 every event reaches a terminal state. Block files are left on disk.
 
+The worker is not notified by `reset_cache()`, and
+`SimpleCPUOffloadScheduler.reset()` waits only for abandoned GPU DMA state.
+It can therefore return `True` and reset the CPU prefix cache while disk worker
+threads still access the released rows.
+
 ## Multi-rank events and restart recovery
+
+Implementation:
+[`SimpleCPUOffloadWorkerMetadata.aggregate`](../../vllm/v1/simple_kv_offload/metadata.py),
+[`_EventLedger.all_reported`](../../vllm/v1/simple_kv_offload/disk_coordinator.py),
+[`DiskTierCoordinator.on_worker_meta`](../../vllm/v1/simple_kv_offload/disk_coordinator.py),
+and [`DiskTierCoordinator._seed_index`](../../vllm/v1/simple_kv_offload/disk_coordinator.py).
 
 Disk load and store successes take effect only after `world_size` workers have
 reported completion. One worker failure currently fails the event immediately
@@ -419,22 +523,42 @@ because a missing rank makes the full KV block unusable; as noted above, the
 associated references are released before the remaining workers necessarily
 stop accessing them.
 
-At startup, `_seed_index()` scans every rank directory, accepts valid `.bin`
-file names, and keeps only the intersection of rank key sets. It restores
-approximate LRU order from rank 0 mtimes. Recovery rebuilds residency only and
-does not prefetch file contents.
+At startup, `_seed_index()` walks the complete sharded directory tree, skips
+non-`.bin` files and invalid hexadecimal names, and collects one key-to-mtime
+map per rank. If any rank has no valid files, recovery seeds no keys. Otherwise
+it keeps the intersection of rank key sets and restores approximate LRU order
+from rank 0 mtimes. Each recovered key passes through `_mark_on_disk()`, so a
+recovered set above the current capacity immediately queues its oldest files
+for deletion. Recovery rebuilds residency only and does not prefetch contents.
 
 ## Capacity and deletion
 
-`disk_capacity_bytes` is converted to a block limit. Completed stores and
-actual loads update `_on_disk` recency. Capacity overflow evicts the oldest key
-not currently staging.
+Implementation:
+[`DiskTierCoordinator._mark_on_disk`](../../vllm/v1/simple_kv_offload/disk_coordinator.py),
+[`DiskTierCoordinator.emit_step`](../../vllm/v1/simple_kv_offload/disk_coordinator.py),
+and [`DiskTier.delete`](../../vllm/v1/simple_kv_offload/disk_backend.py).
+
+`disk_capacity_bytes` is converted to a key-count limit using
+`cpu_capacity_bytes // num_cpu_blocks` as the scheduler's estimate of block
+bytes. The configuration is not divided by world size; the scheduler enforces
+one global key count while every rank stores one file for each key. The
+estimate can differ slightly from the worker's measured sum of segment bytes.
+
+Staging admission moves a key to MRU before its read is emitted; completed
+loads and stores also update recency. Capacity overflow removes the oldest key
+not currently staging and queues its physical deletion for a later
+`emit_step()`.
 
 Deletion is fire-and-forget. The worker queues unlink operations at store
 priority rather than running them on the engine path. A deletion failure can
 leave an orphan file but cannot corrupt serving.
 
 ## Failure semantics
+
+Implementation:
+[`DiskTier._worker`](../../vllm/v1/simple_kv_offload/disk_backend.py),
+[`DiskTierCoordinator._on_load_failed`](../../vllm/v1/simple_kv_offload/disk_coordinator.py),
+and [`DiskTierCoordinator._on_store_failed`](../../vllm/v1/simple_kv_offload/disk_coordinator.py).
 
 | Failure | Behavior |
 | --- | --- |
@@ -446,6 +570,9 @@ leave an orphan file but cannot corrupt serving.
 
 Events are all-or-nothing: a partially read event never installs any CPU row as
 valid KV.
+
+The load-failure path also schedules every failed key for asynchronous file
+deletion, so a missing or truncated file is not repeatedly offered as resident.
 
 ## Supported features
 
@@ -480,7 +607,8 @@ valid KV.
 5. **Cross-instance or single-node-DP index sharing.**
 6. **Per-file checksums.**
 7. **Complete pending-transfer reporting.** `has_pending_transfers()` does not
-   include disk queues.
+   include GPU loads, pending/in-flight disk load or store state, or the worker
+   I/O queue; it observes only scheduler-side GPU-to-CPU store events.
 8. **Eager finish flush.** The final complete block can miss the next eager
    scan if the request finishes in the same step.
 9. **Eager scan rollback after CPU eviction.** Per-request scan progress does
@@ -496,6 +624,6 @@ valid KV.
 | Setting | Default | Description |
 | --- | ---: | --- |
 | `disk_offload_path` | `""` | Empty disables the disk tier |
-| `disk_io_threads` | 8 | Shared priority-queue worker count |
+| `disk_io_threads` | 8 | Split into `max(1, floor(n/2))` read-side and `max(1, n-floor(n/2))` write-side workers; all consume one priority queue |
 | `disk_capacity_bytes` | 0 | Per-rank capacity; zero is unlimited |
-| `disk_stage_min_tokens` | 8192 | Recompute shorter disk runs; zero always attempts staging |
+| `disk_stage_min_tokens` | 8192 | Recompute shorter disk runs; zero still requires at least one complete hash block |
