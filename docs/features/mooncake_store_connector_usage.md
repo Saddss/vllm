@@ -83,6 +83,49 @@ vllm serve meta-llama/Llama-3.1-8B-Instruct \
     --kv-transfer-config '{"kv_connector":"MooncakeStoreConnector","kv_role":"kv_both"}'
 ```
 
+### Asynchronous Store Initialization
+
+By default each rank mounts its `global_segment_size` share of the pool while
+the connector is constructed. Mounting registers host memory with CUDA, which
+cannot run inside the CUDA graph capture window, so a large share lengthens
+startup and has to finish before the rank does anything else.
+
+Set `async_init` to mount the same share after startup instead, one 256 MiB
+segment at a time on a background thread:
+
+```bash
+MOONCAKE_CONFIG_PATH=mooncake_config.json \
+vllm serve meta-llama/Llama-3.1-8B-Instruct \
+    --kv-transfer-config '{
+        "kv_connector":"MooncakeStoreConnector",
+        "kv_role":"kv_both",
+        "kv_connector_extra_config": {"async_init": true}
+    }'
+```
+
+The total contribution is unchanged; only the granularity and the timing
+differ. Until the share is mounted the connector reports itself as
+initializing through vLLM's connector-init handshake, so the scheduler gives
+the connector no new requests. Once every rank reports ready, requests become
+connector-eligible again.
+
+What to expect:
+
+- Preparation starts on the first model-execution step after CUDA graph
+  capture, because host registration must not overlap the capture window. A
+  server that receives no request performs no step, so preparation begins with
+  the first request; that request is served from GPU cache without store
+  lookups and stays connector-ineligible for the rest of its life.
+- Requests that arrive while segments are being mounted still run, and see the
+  per-segment registration cost rather than one long blockage.
+- `async_init` requires a Mooncake build that provides
+  `MooncakeDistributedStore.allocate_and_mount_segment`. Startup fails with a
+  clear message when the installed build does not.
+- `standalone-store` mode is refused: such a rank mounts no segment of its
+  own, so there is nothing to prepare and startup fails with a clear message.
+- A failed segment mount is logged at the moment it happens and raised on the
+  next step, which stops the engine.
+
 ### Disaggregated Prefill-Decode (XpYd)
 
 In disaggregated prefill-decode mode, use `MultiConnector` to combine `MooncakeConnector` (point-to-point KV transfer) with `MooncakeStoreConnector` (shared KV cache pool). This enables both direct P2P transfer between prefiller and decoder, and cross-instance prefix cache sharing via the distributed store.
@@ -249,6 +292,7 @@ Strict isolation requires a Mooncake master started with `--enable_multi_tenants
 - `lookup_rpc_port` (int): Custom port for the ZMQ lookup RPC socket. Default: `0`.
 - `cache_prefix` (str): Namespace prepended to every store key. Lets separate deployments share one Mooncake master without polluting each other — instances configured with different prefixes never see each other's cached blocks, even for identical prompts. All instances that should share a prefix cache must use the same value. Default: `""` (no prefix; keys are byte-identical to the unprefixed format).
 - `save_decode_cache` (bool): Enable offloading decode tokens' KV cache. A `kv_consumer` does not save during prefill; when decode starts, it fills any missing block-aligned prompt prefix before appending completed decode blocks. Default: `false`.
+- `async_init` (bool): Mount this rank's `global_segment_size` share after startup, one 256 MiB segment at a time, instead of mounting it during connector construction. Default: `false`. See [Asynchronous Store Initialization](#asynchronous-store-initialization).
 
 Decode offloading uses the existing TP-rank key namespace. Cross-TP sharing is
 not yet supported.

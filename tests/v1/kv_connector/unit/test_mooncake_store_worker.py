@@ -9,14 +9,18 @@ import math
 import queue
 import sys
 import threading
+import time
 import types
 from types import SimpleNamespace
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock, call, patch
 
 import pytest
 import torch
 
 from tests.v1.attention.utils import dense_kv_cache_views
+from vllm.distributed.kv_transfer.kv_connector.v1.base import (
+    ConnectorInitState,
+)
 from vllm.distributed.kv_transfer.kv_connector.v1.mooncake import (
     rdma_utils,
 )
@@ -3929,3 +3933,266 @@ def test_blob_block_hashes_empty():
     view = BlobBlockHashes(memoryview(b""), 0)
     assert len(view) == 0
     assert list(view) == []
+
+
+# ============================================================
+# asynchronous initialization
+# ============================================================
+
+_CHUNK_BYTES = worker.ASYNC_INIT_CHUNK_SIZE_BYTES
+_POOL_BYTES = 3 * _CHUNK_BYTES
+_READY_TIMEOUT_S = 5.0
+
+
+def _make_segment_result(allocated_bytes: int = _CHUNK_BYTES) -> dict[str, object]:
+    return {
+        "ret": 0,
+        "segment_ids": ["segment-0"],
+        "allocated_size": allocated_bytes,
+    }
+
+
+def _install_segment_store(monkeypatch) -> MagicMock:
+    """Install a fake store whose dynamic segment mount succeeds."""
+    store = MagicMock()
+    store.setup.return_value = 0
+    store.register_buffer.return_value = 0
+    store.allocate_and_mount_segment.return_value = _make_segment_result()
+    _install_fake_mooncake(monkeypatch, store)
+    return store
+
+
+def _build_store_worker(
+    tmp_path,
+    monkeypatch,
+    store,
+    *,
+    async_init: bool,
+    mode: str = "embedded",
+    global_segment_size: object = _POOL_BYTES,
+    kv_role: str = "kv_both",
+    extra_config: dict[str, object] | None = None,
+):
+    _patch_worker_runtime(monkeypatch)
+    monkeypatch.setenv(
+        "MOONCAKE_CONFIG_PATH",
+        _write_mooncake_config(
+            tmp_path,
+            {
+                "mode": mode,
+                "metadata_server": "http://metadata/endpoint",
+                "master_server_address": "10.0.0.7:50051",
+                "protocol": "tcp",
+                "device_name": "",
+                "global_segment_size": global_segment_size,
+                "local_buffer_size": "64mb",
+            },
+        ),
+    )
+    return worker.MooncakeStoreWorker(
+        _make_vllm_config(kv_role=kv_role, extra_config=extra_config),
+        _make_kv_cache_config(),
+        async_init=async_init,
+    )
+
+
+def _make_dense_kv_caches(w) -> dict[str, torch.Tensor]:
+    """Two dense per-layer views over one storage, as the runner hands them."""
+    spec = FullAttentionSpec(
+        block_size=16, num_kv_heads=2, head_size=8, dtype=torch.float16
+    )
+    num_blocks = w.cache_config.num_gpu_blocks
+    raw = torch.zeros(num_blocks * 2 * spec.page_size_bytes, dtype=torch.int8)
+    caches = dense_kv_cache_views(raw, spec, num_blocks, 2, KVCacheLayout.LHBNC)
+    return {"layer0": caches[0], "__cross_layer__": caches[1]}
+
+
+def _wait_for_ready(w) -> None:
+    deadline = time.monotonic() + _READY_TIMEOUT_S
+    while time.monotonic() < deadline:
+        if w.get_connector_init_state() is ConnectorInitState.READY:
+            return
+        time.sleep(0.01)
+    raise AssertionError("asynchronous preparation never reached READY")
+
+
+def test_async_init_defers_pool_mount_until_after_registration(tmp_path, monkeypatch):
+    """setup() contributes no segment, and the pool is mounted only once the
+    worker has registered its KV caches."""
+    store = _install_segment_store(monkeypatch)
+    w = _build_store_worker(tmp_path, monkeypatch, store, async_init=True)
+
+    assert store.setup.call_args.args[2] == 0
+    assert w.get_connector_init_state() is ConnectorInitState.INITIALIZING
+    store.allocate_and_mount_segment.assert_not_called()
+
+    w.register_kv_caches({})
+
+    # Registration records what has to be mounted; the mount itself starts at
+    # the first status query, which happens after graph capture.
+    store.allocate_and_mount_segment.assert_not_called()
+    assert w.get_connector_init_state() is ConnectorInitState.INITIALIZING
+    _wait_for_ready(w)
+
+
+def test_async_init_mounts_pool_in_equal_chunks(tmp_path, monkeypatch):
+    """The background task requests the configured pool as 256 MiB segments."""
+    store = _install_segment_store(monkeypatch)
+    w = _build_store_worker(tmp_path, monkeypatch, store, async_init=True)
+    w.register_kv_caches({})
+    _wait_for_ready(w)
+
+    assert store.allocate_and_mount_segment.call_args_list == [
+        call(_CHUNK_BYTES, "tcp", "") for _ in range(_POOL_BYTES // _CHUNK_BYTES)
+    ]
+
+
+def test_async_init_mounts_after_capacity_only_registration(tmp_path, monkeypatch):
+    """A capacity-only rank registers no tensors, and still mounts its share,
+    which is the only capacity it contributes."""
+    store = _install_segment_store(monkeypatch)
+    w = _build_store_worker(
+        tmp_path,
+        monkeypatch,
+        store,
+        async_init=True,
+        kv_role="kv_consumer",
+        extra_config={"enable_lookup": False},
+    )
+    assert w._capacity_only is True
+
+    w.register_kv_caches({})
+
+    assert w.get_connector_init_state() is ConnectorInitState.INITIALIZING
+    _wait_for_ready(w)
+    assert store.allocate_and_mount_segment.call_count == _POOL_BYTES // _CHUNK_BYTES
+
+
+def test_async_init_mounts_after_full_registration(tmp_path, monkeypatch):
+    """The normal registration path, which hands over real tensors, unlocks the
+    preparation as well."""
+    store = _install_segment_store(monkeypatch)
+    w = _build_store_worker(tmp_path, monkeypatch, store, async_init=True)
+
+    _register_with_mocked_threads(w, _make_dense_kv_caches(w))
+
+    assert w.get_connector_init_state() is ConnectorInitState.INITIALIZING
+    _wait_for_ready(w)
+    assert store.allocate_and_mount_segment.call_count == _POOL_BYTES // _CHUNK_BYTES
+
+
+def test_async_init_reports_ready_only_after_every_segment(tmp_path, monkeypatch):
+    """A pool that is still being mounted keeps the connector initializing."""
+    store = _install_segment_store(monkeypatch)
+    release = threading.Event()
+    mounts = []
+
+    def mount(size, protocol, location):
+        mounts.append(size)
+        if len(mounts) == _POOL_BYTES // _CHUNK_BYTES:
+            release.wait(_READY_TIMEOUT_S)
+        return _make_segment_result()
+
+    store.allocate_and_mount_segment.side_effect = mount
+    w = _build_store_worker(tmp_path, monkeypatch, store, async_init=True)
+    w.register_kv_caches({})
+    w.get_connector_init_state()
+
+    assert w.get_connector_init_state() is ConnectorInitState.INITIALIZING
+    release.set()
+    _wait_for_ready(w)
+    assert mounts == [_CHUNK_BYTES] * (_POOL_BYTES // _CHUNK_BYTES)
+
+
+def test_sync_init_mounts_whole_pool_at_setup(tmp_path, monkeypatch):
+    """Without async_init the pool is mounted by setup() itself."""
+    store = MagicMock()
+    store.setup.return_value = 0
+    _install_fake_mooncake(monkeypatch, store)
+    w = _build_store_worker(tmp_path, monkeypatch, store, async_init=False)
+
+    assert store.setup.call_args.args[2] == _POOL_BYTES
+    w.register_kv_caches({})
+    assert w.get_connector_init_state() is ConnectorInitState.READY
+    store.allocate_and_mount_segment.assert_not_called()
+
+
+def test_async_init_failure_raises_on_next_query(tmp_path, monkeypatch):
+    """A rejected segment mount stops the engine instead of leaving the
+    connector initializing forever."""
+    store = _install_segment_store(monkeypatch)
+    store.allocate_and_mount_segment.return_value = {
+        "ret": -1,
+        "segment_ids": [],
+        "allocated_size": 0,
+    }
+    w = _build_store_worker(tmp_path, monkeypatch, store, async_init=True)
+    w.register_kv_caches({})
+    w.get_connector_init_state()
+
+    assert w._init_future is not None
+    assert isinstance(w._init_future.exception(timeout=_READY_TIMEOUT_S), RuntimeError)
+    with pytest.raises(RuntimeError, match="preparation failed"):
+        w.get_connector_init_state()
+
+
+def test_async_init_requires_dynamic_segment_api(tmp_path, monkeypatch):
+    """Mooncake builds without allocate_and_mount_segment cannot prepare a
+    pool after setup, so the worker refuses to start."""
+    store = MagicMock(spec=["setup"])
+    _install_fake_mooncake(monkeypatch, store)
+
+    with pytest.raises(RuntimeError, match="allocate_and_mount_segment"):
+        _build_store_worker(tmp_path, monkeypatch, store, async_init=True)
+
+
+def test_async_init_rejected_in_standalone_store_mode(tmp_path, monkeypatch):
+    """A standalone-store rank owns no segment, so there is nothing to
+    prepare and the combination is refused."""
+    store = _install_segment_store(monkeypatch)
+
+    with pytest.raises(ValueError, match="standalone-store"):
+        _build_store_worker(
+            tmp_path,
+            monkeypatch,
+            store,
+            async_init=True,
+            mode="standalone-store",
+            global_segment_size=0,
+        )
+
+
+def test_close_stops_preparation_between_segments(tmp_path, monkeypatch):
+    """Teardown waits for the segment being mounted, then stops the loop, so
+    a large pool does not extend shutdown by its remaining segments."""
+    store = _install_segment_store(monkeypatch)
+    release = threading.Event()
+    mounts = []
+
+    def mount(size, protocol, location):
+        mounts.append(size)
+        release.wait(_READY_TIMEOUT_S)
+        return _make_segment_result()
+
+    store.allocate_and_mount_segment.side_effect = mount
+    w = _build_store_worker(tmp_path, monkeypatch, store, async_init=True)
+    w.register_kv_caches({})
+    w.get_connector_init_state()
+
+    deadline = time.monotonic() + _READY_TIMEOUT_S
+    while not mounts:
+        assert time.monotonic() < deadline, "preparation never started"
+        time.sleep(0.01)
+
+    closer = threading.Thread(target=w.close)
+    closer.start()
+    while not w._init_stop.is_set():
+        assert time.monotonic() < deadline, "close() never asked for a stop"
+        time.sleep(0.01)
+    release.set()
+    closer.join(_READY_TIMEOUT_S)
+
+    assert not closer.is_alive()
+    assert len(mounts) == 1
+    store.close.assert_called_once()
+    assert w.store is None
