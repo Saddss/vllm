@@ -23,6 +23,7 @@ from vllm.distributed.kv_events import (
     KVEventAggregator,
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.base import (
+    ConnectorInitState,
     KVConnectorBase_V1,
     KVConnectorMetadata,
     KVConnectorRole,
@@ -131,6 +132,11 @@ class MooncakeStoreConnector(KVConnectorBase_V1, SupportsHMA):
         assert kv_cache_config is not None, "kv_cache_config is required"
         self.kv_role = vllm_config.kv_transfer_config.kv_role
         extra_config = vllm_config.kv_transfer_config.kv_connector_extra_config
+        async_init = extra_config.get("async_init", False)
+        if not isinstance(async_init, bool):
+            raise ValueError("Mooncake async_init must be a boolean")
+        if async_init:
+            self.enable_async_init()
         save_decode_cache = extra_config.get("save_decode_cache", False)
         # Capacity-only: contributes its segment to the store pool but transfers
         # no KV, so the KV-cache-shape invariants below cannot be reached.
@@ -152,7 +158,14 @@ class MooncakeStoreConnector(KVConnectorBase_V1, SupportsHMA):
                 vllm_config, kv_cache_config
             )
         else:
-            self.connector_worker = MooncakeStoreWorker(vllm_config, kv_cache_config)
+            self.connector_worker = MooncakeStoreWorker(
+                vllm_config, kv_cache_config, async_init=async_init
+            )
+
+    def get_connector_init_state(self) -> ConnectorInitState | None:
+        if self.connector_worker is not None:
+            return self.connector_worker.get_connector_init_state()
+        return None
 
     def shutdown(self):
         """Release connector resources on teardown.

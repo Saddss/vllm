@@ -35,6 +35,7 @@ from vllm.distributed import (
     get_tensor_model_parallel_world_size,
 )
 from vllm.distributed.kv_events import BlockStored
+from vllm.distributed.kv_transfer.kv_connector.v1.base import ConnectorInitState
 from vllm.distributed.kv_transfer.kv_connector.v1.mooncake import rdma_utils
 from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store.coordinator import (  # noqa: E501
     ExternalCachedBlockPool,
@@ -87,6 +88,10 @@ logger = init_logger(__name__)
 DEFAULT_GLOBAL_SEGMENT_SIZE = 4 * 1024 * 1024 * 1024  # 4 GiB
 DEFAULT_LOCAL_BUFFER_SIZE = 4 * 1024 * 1024 * 1024  # 4 GiB
 DEFAULT_TENANT_ID = "default"
+
+# Requested size of one dynamically mounted Store segment. A smaller segment
+# shortens each CUDA host registration, which is what stalls inference.
+ASYNC_INIT_CHUNK_SIZE_BYTES = 256 * 1024**2
 
 MOONCAKE_NO_AVAILABLE_HANDLE = -200
 _T = TypeVar("_T")
@@ -1423,6 +1428,8 @@ class MooncakeStoreWorker:
         self,
         vllm_config: VllmConfig,
         kv_cache_config: KVCacheConfig,
+        *,
+        async_init: bool = False,
     ):
         try:
             from mooncake.store import (  # type: ignore
@@ -1435,6 +1442,19 @@ class MooncakeStoreWorker:
                 "https://github.com/kvcache-ai/Mooncake/blob/main/doc/"
                 "en/build.md to run vLLM with MooncakeStoreConnector."
             ) from e
+
+        self._async_init = async_init
+        self._kv_caches_registered = False
+        self._init_executor: ThreadPoolExecutor | None = None
+        self._init_future: Future[None] | None = None
+        self._init_stop = threading.Event()
+        # The accelerator device is thread-local; the preparation thread
+        # re-applies the index selected here.
+        self._init_device = (
+            torch.accelerator.current_device_index()
+            if async_init and torch.accelerator.is_available()
+            else None
+        )
 
         model_config = vllm_config.model_config
         parallel_config = vllm_config.parallel_config
@@ -1475,7 +1495,19 @@ class MooncakeStoreWorker:
 
         # Initialize MooncakeDistributedStore with its own TransferEngine
         store_config = MooncakeStoreConfig.load_from_config()
+        if async_init and store_config.mode == "standalone-store":
+            raise ValueError(
+                "async_init is not supported in standalone-store mode: this "
+                "rank mounts no segment of its own."
+            )
+        self._store_config = store_config
         self.store = MooncakeDistributedStore()
+        if async_init and not hasattr(self.store, "allocate_and_mount_segment"):
+            raise RuntimeError(
+                "Mooncake asynchronous initialization requires a Mooncake "
+                "build that provides "
+                "MooncakeDistributedStore.allocate_and_mount_segment."
+            )
         local_ip = get_ip()
         local_hostname = rdma_utils.get_requester_local_hostname(local_ip)
         setup_kwargs: dict[str, str] = {}
@@ -1484,7 +1516,9 @@ class MooncakeStoreWorker:
         ret = self.store.setup(
             local_hostname,
             store_config.metadata_server,
-            store_config.global_segment_size,
+            # Async mode contributes no segment here; the pool is mounted
+            # after startup.
+            0 if async_init else store_config.global_segment_size,
             store_config.local_buffer_size,
             store_config.protocol,
             store_config.device_name,
@@ -1703,15 +1737,98 @@ class MooncakeStoreWorker:
             for g_idx, db in enumerate(self.token_dbs)
         )
 
+    def get_connector_init_state(self) -> ConnectorInitState:
+        """Report whether this worker can already serve store traffic.
+
+        The asynchronous preparation starts at the first query after the KV
+        caches are registered, which is the earliest point where host
+        registration may run: it must not overlap graph capture.
+        """
+        if not self._kv_caches_registered:
+            return ConnectorInitState.INITIALIZING
+        if not self._async_init:
+            return ConnectorInitState.READY
+        if self._init_future is None:
+            self._init_executor = ThreadPoolExecutor(
+                max_workers=1, thread_name_prefix="MooncakeStoreInit"
+            )
+            self._init_future = self._init_executor.submit(self._allocate_store_segment)
+            return ConnectorInitState.INITIALIZING
+        if not self._init_future.done():
+            return ConnectorInitState.INITIALIZING
+        self._init_future.result()
+        return ConnectorInitState.READY
+
+    def _allocate_store_segment(self) -> None:
+        """Mount the configured pool capacity one segment at a time."""
+        config = self._store_config
+        if self._init_device is not None:
+            torch.accelerator.set_device_index(self._init_device)
+        started = time.perf_counter()
+        logger.info(
+            "Mooncake asynchronous segment preparation started: bytes=%d",
+            config.global_segment_size,
+        )
+        allocated_bytes = 0
+        while (
+            allocated_bytes < config.global_segment_size
+            and not self._init_stop.is_set()
+        ):
+            requested_bytes = min(
+                config.global_segment_size - allocated_bytes,
+                ASYNC_INIT_CHUNK_SIZE_BYTES,
+            )
+            result = self.store.allocate_and_mount_segment(
+                requested_bytes, config.protocol, ""
+            )
+            if (
+                result["ret"] != 0
+                or result["allocated_size"] < requested_bytes
+                or not result["segment_ids"]
+            ):
+                # Report here as well: the exception below only reaches the
+                # engine on the next execution step, which on an idle server
+                # can be much later.
+                logger.error(
+                    "Mooncake asynchronous segment preparation failed: %s", result
+                )
+                raise RuntimeError(
+                    f"Mooncake asynchronous segment preparation failed: {result}"
+                )
+            # The SDK rounds the request up to its slab size.
+            allocated_bytes += result["allocated_size"]
+            if allocated_bytes < config.global_segment_size:
+                # Registration serializes other CUDA API calls; leave a gap so
+                # the inference thread can submit work between segments.
+                time.sleep(0.001)
+        seconds = time.perf_counter() - started
+        if allocated_bytes < config.global_segment_size:
+            # close() asked the loop to stop before the pool was complete.
+            logger.info(
+                "Mooncake asynchronous segment preparation stopped: "
+                "bytes=%d, seconds=%.6f",
+                allocated_bytes,
+                seconds,
+            )
+            return
+        logger.info(
+            "Mooncake asynchronous segment preparation completed: "
+            "bytes=%d, seconds=%.6f",
+            allocated_bytes,
+            seconds,
+        )
+
     def register_kv_caches(
         self,
         kv_caches: dict[str, torch.Tensor],
     ) -> None:
         """Register KV cache tensors and start transfer threads."""
         if self._capacity_only:
+            self._kv_caches_registered = True
             return
         if not kv_caches:
             logger.warning("No KV caches to offload.")
+            self._kv_caches_registered = True
             return
 
         assert self.cache_config.num_gpu_blocks is not None
@@ -1826,6 +1943,7 @@ class MooncakeStoreWorker:
         logger.info(
             "Started %d Mooncake KV-load receive thread(s)", self.num_recv_threads
         )
+        self._kv_caches_registered = True
 
     def start_load_kv(self, metadata: MooncakeStoreConnectorMetadata):
         """Issue async loads.
@@ -2137,6 +2255,12 @@ class MooncakeStoreWorker:
         store = getattr(self, "store", None)
         if store is None:
             return
+        executor = getattr(self, "_init_executor", None)
+        if executor is not None:
+            # Stop after the segment in flight, so the handle is closed with no
+            # call into it running.
+            self._init_stop.set()
+            executor.shutdown(wait=True, cancel_futures=True)
         self.store = None
         try:
             store.close()
