@@ -11,6 +11,7 @@ import torch
 from vllm.config import set_current_vllm_config
 from vllm.distributed.kv_events import BlockStored
 from vllm.distributed.kv_transfer.kv_connector.v1.base import (
+    ConnectorInitState,
     KVConnectorRole,
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store import (
@@ -811,3 +812,100 @@ def test_shutdown_scheduler_role_is_noop():
     # Scheduler role holds no store handle, so shutdown must be a safe no-op.
     assert connector.connector_worker is None
     connector.shutdown()
+
+
+# ============================================================
+# asynchronous initialization
+# ============================================================
+
+_WORKER_PATCH = (
+    "vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store."
+    "connector.MooncakeStoreWorker"
+)
+_SCHEDULER_PATCH = (
+    "vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store."
+    "connector.MooncakeStoreScheduler"
+)
+
+
+def _make_async_vllm_config(**extra_config):
+    return create_vllm_config(
+        kv_connector="MooncakeStoreConnector",
+        kv_role="kv_both",
+        kv_connector_extra_config=extra_config,
+    )
+
+
+def _make_worker_connector(vllm_config, kv_cache_config):
+    """Build a worker-role connector with the store worker mocked out."""
+    with (
+        set_current_vllm_config(vllm_config),
+        patch(_WORKER_PATCH) as worker_patch,
+    ):
+        connector = mooncake_store_connector.MooncakeStoreConnector(
+            vllm_config, KVConnectorRole.WORKER, kv_cache_config
+        )
+    return connector, worker_patch
+
+
+def test_async_init_must_be_boolean():
+    """A non-boolean extra_config value is refused before any store work."""
+    vllm_config = _make_async_vllm_config(async_init="yes")
+
+    with (
+        set_current_vllm_config(vllm_config),
+        pytest.raises(ValueError, match="must be a boolean"),
+    ):
+        mooncake_store_connector.MooncakeStoreConnector(
+            vllm_config, KVConnectorRole.WORKER, _make_kv_cache_config()
+        )
+
+
+def test_async_init_is_forwarded_to_the_store_worker():
+    vllm_config = _make_async_vllm_config(async_init=True)
+    kv_cache_config = _make_kv_cache_config()
+
+    connector, worker_patch = _make_worker_connector(vllm_config, kv_cache_config)
+
+    worker_patch.assert_called_once_with(vllm_config, kv_cache_config, async_init=True)
+    assert connector.connector_worker is worker_patch.return_value
+
+
+def test_worker_connector_readiness_tracks_worker_init_state():
+    """The scheduler only admits connector requests once the worker reports
+    READY, so worker readiness has to surface through is_connector_ready()."""
+    vllm_config = _make_async_vllm_config(async_init=True)
+    connector, worker_patch = _make_worker_connector(
+        vllm_config, _make_kv_cache_config()
+    )
+    init_state = worker_patch.return_value.get_connector_init_state
+
+    init_state.return_value = ConnectorInitState.INITIALIZING
+    assert connector.is_connector_ready() is False
+
+    init_state.return_value = ConnectorInitState.READY
+    assert connector.is_connector_ready() is True
+
+
+def test_scheduler_connector_waits_for_worker_reports():
+    """With async_init the scheduler side starts unready and stays unready
+    until every worker rank has reported."""
+    vllm_config = _make_async_vllm_config(async_init=True)
+
+    with (
+        set_current_vllm_config(vllm_config),
+        patch(_SCHEDULER_PATCH),
+    ):
+        connector = mooncake_store_connector.MooncakeStoreConnector(
+            vllm_config, KVConnectorRole.SCHEDULER, _make_kv_cache_config()
+        )
+
+    assert connector.get_connector_init_state() is None
+    assert connector.is_connector_ready() is False
+
+
+def test_sync_connector_is_ready_without_handshake():
+    vllm_config = _make_vllm_config()
+    connector, _ = _make_worker_connector(vllm_config, _make_kv_cache_config())
+
+    assert connector.is_connector_ready() is True
